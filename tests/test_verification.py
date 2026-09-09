@@ -15,10 +15,10 @@ def _quartiles():
 def test_wos_count_has_priority_over_scival():
     rules = RuleEngine.from_yaml("config/rules_2025.yaml")
     group = [
-        SourceRecord(source="omega", source_id="o", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1/x"),
-        SourceRecord(source="wos", source_id="w", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1/x", institution_count=11, muv_affiliation=True),
+        SourceRecord(source="omega", source_id="o", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1000/x"),
+        SourceRecord(source="wos", source_id="w", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1000/x", institution_count=11, muv_affiliation=True),
     ]
-    pub = merge_group(group, quartiles=_quartiles(), rules=rules, scival_lookup={("doi", "10.1/x"): 9})
+    pub = merge_group(group, quartiles=_quartiles(), rules=rules, scival_lookup={("doi", "10.1000/x"): 9})
     assert pub.selected_institution_count == 11
     assert pub.institution_count_source == "wos"
     assert pub.over_10_institutions is True
@@ -29,10 +29,10 @@ def test_wos_count_has_priority_over_scival():
 def test_scival_is_used_when_wos_count_missing():
     rules = RuleEngine.from_yaml("config/rules_2025.yaml")
     group = [
-        SourceRecord(source="omega", source_id="o", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1/x"),
-        SourceRecord(source="wos", source_id="w", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1/x", institution_count=None, muv_affiliation=True),
+        SourceRecord(source="omega", source_id="o", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1000/x"),
+        SourceRecord(source="wos", source_id="w", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1000/x", institution_count=None, muv_affiliation=True),
     ]
-    pub = merge_group(group, quartiles=_quartiles(), rules=rules, scival_lookup={("doi", "10.1/x"): 9})
+    pub = merge_group(group, quartiles=_quartiles(), rules=rules, scival_lookup={("doi", "10.1000/x"): 9})
     assert pub.selected_institution_count == 9
     assert pub.institution_count_source == "scival"
     assert pub.weighted_contribution == 1.0
