@@ -16,6 +16,7 @@ from monverify.ministry import parse_ministry_workbook
 from monverify.omega import omega_records
 from monverify.reporting import publications_dataframe
 from monverify.rules import RuleEngine
+from monverify.scival import inspect_scival
 from monverify.verification import aggregate, build_canonical_publications, compare_to_ministry
 
 st.set_page_config(page_title="MON Verify — MU-Varna", layout="wide")
@@ -36,7 +37,7 @@ def _save_upload(upload, folder: Path, prefix: str = "") -> Path | None:
 
 
 def _save_uploads(uploads, folder: Path, prefix: str) -> list[Path]:
-    return [_save_upload(upload, folder, f"{prefix}{i}_") for i, upload in enumerate(uploads or [], start=1)]
+    return [x for x in (_save_upload(upload, folder, f"{prefix}{i}_") for i, upload in enumerate(uploads or [], 1)) if x]
 
 
 def _secret(name: str) -> str:
@@ -50,15 +51,15 @@ def _api_error_text(service: str, exc: APIRequestError) -> str:
     status = exc.status_code
     if service == "Scopus" and status == 401:
         message = (
-            "Scopus rejected the request with HTTP 401 Unauthorized. The API key may be invalid, "
-            "or the request may lack the institutional entitlement required from Streamlit Cloud."
+            "Scopus returned HTTP 401 Unauthorized. The API key can still be valid locally if access depends "
+            "on the MU-Varna institutional IP range; Streamlit Cloud is outside that range."
         )
     elif service == "Scopus" and status == 403:
-        message = "Scopus authenticated the request but denied access (HTTP 403). Check API entitlements/Insttoken."
+        message = "Scopus returned HTTP 403. Check the API entitlement or institutional token."
     elif status in {401, 403}:
-        message = f"{service} authentication/authorization failed (HTTP {status}). Check the configured API credentials and entitlement."
+        message = f"{service} authentication/authorization failed (HTTP {status})."
     elif status == 429:
-        message = f"{service} rate limit reached (HTTP 429). Try again later or use cached/uploaded API evidence."
+        message = f"{service} rate limit reached (HTTP 429)."
     elif status:
         message = f"{service} API returned HTTP {status}."
     else:
@@ -73,10 +74,8 @@ def _show_api_failure(service: str, exc: Exception) -> None:
         st.error(_api_error_text(service, exc))
         if service == "Scopus" and exc.status_code in {401, 403}:
             st.info(
-                "Streamlit Community Cloud runs outside the MU-Varna institutional IP range. "
-                "If your Scopus access depends on institutional IP authentication, configure an Elsevier "
-                "institution token (`SCOPUS_INSTTOKEN`) in Streamlit Secrets, or retrieve Scopus data locally "
-                "and use Uploaded/cached data mode."
+                "Use the SciVal CSV as the institution-count fallback and/or retrieve Scopus JSON locally. "
+                "A Scopus Insttoken can also be configured later if Elsevier provides one."
             )
     else:
         st.error(f"{service} retrieval failed: {exc}")
@@ -87,6 +86,7 @@ with st.sidebar:
     mode = st.radio("Data source", ["Uploaded/cached data", "Live APIs"])
     st.markdown("**Institution identifiers**")
     st.code(f"WoS: Medical University Varna\nWoS database: {WOS_DATABASE_ID}\nScopus AF-ID: 60005828")
+    st.caption("Institution-count priority: WoS → Scopus → SciVal")
 
 st.subheader("Input files")
 col1, col2, col3 = st.columns(3)
@@ -96,6 +96,24 @@ with col2:
     omega_upload = st.file_uploader("OMEGA CSV", type=["csv"])
 with col3:
     quartile_upload = st.file_uploader("2025 JCR/InCites quartiles CSV", type=["csv"])
+
+scival_upload = st.file_uploader(
+    "Optional SciVal publication export (institution-count fallback)",
+    type=["csv"],
+    help="The standard SciVal export is auto-detected. SciVal supplies institution counts only; it does not by itself prove Ministry eligibility.",
+)
+if scival_upload is not None:
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / scival_upload.name
+            p.write_bytes(scival_upload.getvalue())
+            info = inspect_scival(p)
+        st.success(
+            f"SciVal loaded: {info['rows']} publications · {info['over_10_institutions']} with >10 institutions · "
+            f"maximum {info['max_institutions']} institutions."
+        )
+    except Exception as exc:
+        st.error(f"SciVal file could not be read: {exc}")
 
 wos_uploads: list = []
 scopus_uploads: list = []
@@ -107,14 +125,14 @@ if mode == "Uploaded/cached data":
             "Optional WoS JSON files",
             type=["json"],
             accept_multiple_files=True,
-            help="You can upload both institution-discovery and OMEGA-ID verification JSON files.",
+            help="Upload discovery and/or OMEGA-ID verification JSON files.",
         )
     with col5:
         scopus_uploads = st.file_uploader(
             "Optional Scopus JSON files",
             type=["json"],
             accept_multiple_files=True,
-            help="You can upload both institution-discovery and OMEGA-ID verification JSON files.",
+            help="Upload locally retrieved Scopus JSON when Streamlit Cloud cannot authenticate.",
         )
 else:
     st.subheader("Live API retrieval")
@@ -129,11 +147,8 @@ else:
         "Optional Scopus institution token", value=_secret("SCOPUS_INSTTOKEN"), type="password"
     ).strip()
     year = st.number_input("Year", min_value=2000, max_value=2100, value=2025, step=1)
-
     st.caption(
-        "Configured credentials — "
-        f"WoS API key: {'yes' if wos_key else 'no'} · "
-        f"Scopus API key: {'yes' if scopus_key else 'no'} · "
+        f"Configured credentials — WoS: {'yes' if wos_key else 'no'} · Scopus: {'yes' if scopus_key else 'no'} · "
         f"Scopus Insttoken: {'yes' if scopus_insttoken else 'no'}"
     )
 
@@ -147,7 +162,6 @@ else:
             st.session_state["scopus_live_files"] = []
             st.session_state["api_errors"] = []
             omega_source_records = []
-
             if "Verify OMEGA identifiers" in workflows and omega_upload is not None:
                 with tempfile.TemporaryDirectory() as tmp:
                     omega_path = Path(tmp) / omega_upload.name
@@ -161,17 +175,16 @@ else:
                         with st.spinner("WoS: independent institutional discovery..."):
                             query = f'OG=("Medical University Varna") AND PY={int(year)}'
                             pages = client.search_pages(query, database_id=WOS_DATABASE_ID)
-                            wrapper = {
-                                "mode": "institution_discovery",
-                                "query": query,
-                                "database_id": WOS_DATABASE_ID,
-                                "retrieved_at": datetime.now(timezone.utc).isoformat(),
-                                "pages": pages,
-                            }
-                            st.session_state["wos_live_files"].append(wrapper)
-                            st.success(
-                                f"WoS discovery: {sum(len(wos_records_from_payload(p)) for p in pages)} record(s)."
+                            st.session_state["wos_live_files"].append(
+                                {
+                                    "mode": "institution_discovery",
+                                    "query": query,
+                                    "database_id": WOS_DATABASE_ID,
+                                    "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                                    "pages": pages,
+                                }
                             )
+                            st.success(f"WoS discovery: {sum(len(wos_records_from_payload(p)) for p in pages)} record(s).")
                     if "Verify OMEGA identifiers" in workflows:
                         with st.spinner("WoS: verifying OMEGA identifiers..."):
                             ids = sorted({r.wos_ut for r in omega_source_records if r.wos_ut})
@@ -205,9 +218,7 @@ else:
                                     "pages": pages,
                                 }
                             )
-                            st.success(
-                                f"Scopus discovery: {sum(len(scopus_entries_from_payload(p)) for p in pages)} record(s)."
-                            )
+                            st.success(f"Scopus discovery: {sum(len(scopus_entries_from_payload(p)) for p in pages)} record(s).")
                     if "Verify OMEGA identifiers" in workflows:
                         with st.spinner("Scopus: verifying OMEGA identifiers..."):
                             ids = sorted({r.scopus_id for r in omega_source_records if r.scopus_id})
@@ -221,20 +232,16 @@ else:
                                 }
                             )
                             failures = sum(1 for x in abstracts if x.get("_monverify_error"))
-                            st.success(
-                                f"Scopus OMEGA-ID verification requested {len(ids)} identifier(s); failures: {failures}."
-                            )
+                            st.success(f"Scopus OMEGA-ID verification requested {len(ids)} identifier(s); failures: {failures}.")
                 except Exception as exc:
                     st.session_state["api_errors"].append({"service": "Scopus", "error": str(exc)})
                     _show_api_failure("Scopus", exc)
 
-            available = len(st.session_state.get("wos_live_files", [])) + len(
-                st.session_state.get("scopus_live_files", [])
-            )
+            available = len(st.session_state.get("wos_live_files", [])) + len(st.session_state.get("scopus_live_files", []))
             if available:
-                st.success(f"API retrieval completed with {available} cached evidence set(s). You can run verification now.")
+                st.success(f"API retrieval completed with {available} evidence set(s). You can run verification now.")
             elif st.session_state.get("api_errors"):
-                st.warning("No live API evidence was retrieved. You can still switch to Uploaded/cached data mode.")
+                st.warning("No live API evidence was retrieved. Uploaded/cached mode remains available.")
 
 if st.button("Run verification", disabled=not (ministry_upload and omega_upload and quartile_upload)):
     with tempfile.TemporaryDirectory() as tmp:
@@ -242,11 +249,12 @@ if st.button("Run verification", disabled=not (ministry_upload and omega_upload 
         ministry_path = _save_upload(ministry_upload, folder)
         omega_path = _save_upload(omega_upload, folder)
         quartile_path = _save_upload(quartile_upload, folder)
+        scival_path = _save_upload(scival_upload, folder, "scival_") if scival_upload else None
         wos_paths: list[Path] = []
         scopus_paths: list[Path] = []
         if mode == "Uploaded/cached data":
-            wos_paths = [x for x in _save_uploads(wos_uploads, folder, "wos_") if x]
-            scopus_paths = [x for x in _save_uploads(scopus_uploads, folder, "scopus_") if x]
+            wos_paths = _save_uploads(wos_uploads, folder, "wos_")
+            scopus_paths = _save_uploads(scopus_uploads, folder, "scopus_")
         else:
             for i, payload in enumerate(st.session_state.get("wos_live_files", []), start=1):
                 path = folder / f"wos_live_{i}.json"
@@ -264,6 +272,7 @@ if st.button("Run verification", disabled=not (ministry_upload and omega_upload 
             rules_path=RULES_PATH,
             wos_json=wos_paths,
             scopus_json=scopus_paths,
+            scival_csv=scival_path,
         )
         st.session_state["claim"] = claim.model_dump()
         st.session_state["pubs"] = [p.model_dump() for p in pubs]
@@ -287,27 +296,16 @@ if "pubs" in st.session_state:
         pub_count if pub_count is not None else "unresolved",
         (pub_count - claim.publication_count if pub_count is not None else None),
     )
-    q1w = agg["weighted"]["a1"]
-    q2w = agg["weighted"]["a2"]
-    score = agg["a_score"]
-    c2.metric(
-        "Q1 weighted",
-        q1w if q1w is not None else "unresolved",
-        (round(q1w - claim.q1_weighted, 3) if q1w is not None else None),
-    )
-    c3.metric(
-        "Q2 weighted",
-        q2w if q2w is not None else "unresolved",
-        (round(q2w - claim.q2_weighted, 3) if q2w is not None else None),
-    )
-    c4.metric(
-        "a score",
-        score if score is not None else "unresolved",
-        (round(score - claim.a_score, 3) if score is not None else None),
-    )
+    q1w, q2w, score = agg["weighted"]["a1"], agg["weighted"]["a2"], agg["a_score"]
+    c2.metric("Q1 weighted", q1w if q1w is not None else "unresolved", (round(q1w - claim.q1_weighted, 3) if q1w is not None else None))
+    c3.metric("Q2 weighted", q2w if q2w is not None else "unresolved", (round(q2w - claim.q2_weighted, 3) if q2w is not None else None))
+    c4.metric("a score", score if score is not None else "unresolved", (round(score - claim.a_score, 3) if score is not None else None))
+
+    source_counts = frame["institution_count_source"].fillna("unresolved").value_counts().to_dict() if not frame.empty else {}
     st.caption(
         f"Candidates: {agg['candidate_publication_count']} · confirmed eligible: {agg['confirmed_publication_count']} · "
-        f"excluded: {agg['excluded_publication_count']} · unresolved eligibility: {agg['unresolved_eligibility_count']}"
+        f"excluded: {agg['excluded_publication_count']} · unresolved eligibility: {agg['unresolved_eligibility_count']} · "
+        f"count sources: {source_counts}"
     )
     st.dataframe(comparison, use_container_width=True, hide_index=True)
 
@@ -318,48 +316,18 @@ if "pubs" in st.session_state:
         discrepancies = frame[frame["discrepancy_codes"].fillna("").str.len() > 0]
         st.dataframe(discrepancies, use_container_width=True, hide_index=True)
     with tabs[2]:
-        over_10 = frame[frame["over_10_institutions"] == True]
+        over_10 = frame[frame["over_10_institutions"] == True]  # noqa: E712
         st.dataframe(over_10, use_container_width=True, hide_index=True)
     with tabs[3]:
         unresolved = frame[frame["verification_status"] == "manual_review"]
         st.dataframe(unresolved, use_container_width=True, hide_index=True)
     with tabs[4]:
-        st.download_button(
-            "canonical_publications.csv",
-            frame.to_csv(index=False).encode("utf-8-sig"),
-            "canonical_publications.csv",
-            "text/csv",
-        )
-        st.download_button(
-            "ministry_comparison.csv",
-            comparison.to_csv(index=False).encode("utf-8-sig"),
-            "ministry_comparison.csv",
-            "text/csv",
-        )
-        st.download_button(
-            "ministry_corrections.csv",
-            discrepancies.to_csv(index=False).encode("utf-8-sig"),
-            "ministry_corrections.csv",
-            "text/csv",
-        )
-        st.download_button(
-            "unresolved_records.csv",
-            unresolved.to_csv(index=False).encode("utf-8-sig"),
-            "unresolved_records.csv",
-            "text/csv",
-        )
-        st.download_button(
-            "over_10_institutions.csv",
-            over_10.to_csv(index=False).encode("utf-8-sig"),
-            "over_10_institutions.csv",
-            "text/csv",
-        )
+        st.download_button("canonical_publications.csv", frame.to_csv(index=False).encode("utf-8-sig"), "canonical_publications.csv", "text/csv")
+        st.download_button("ministry_comparison.csv", comparison.to_csv(index=False).encode("utf-8-sig"), "ministry_comparison.csv", "text/csv")
+        st.download_button("ministry_corrections.csv", discrepancies.to_csv(index=False).encode("utf-8-sig"), "ministry_corrections.csv", "text/csv")
+        st.download_button("unresolved_records.csv", unresolved.to_csv(index=False).encode("utf-8-sig"), "unresolved_records.csv", "text/csv")
+        st.download_button("over_10_institutions.csv", over_10.to_csv(index=False).encode("utf-8-sig"), "over_10_institutions.csv", "text/csv")
         summary = {"ministry_claim": claim.model_dump(), "calculated": agg}
-        st.download_button(
-            "verification_summary.json",
-            json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8"),
-            "verification_summary.json",
-            "application/json",
-        )
+        st.download_button("verification_summary.json", json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8"), "verification_summary.json", "application/json")
 else:
-    st.info("Upload the three required files, optionally retrieve/upload API evidence, then run verification.")
+    st.info("Upload the three required files, optionally add SciVal/API evidence, then run verification.")
