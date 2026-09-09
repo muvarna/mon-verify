@@ -22,6 +22,20 @@ EXPECTED_COLUMNS = {
     "Link Scopus",
 }
 
+OMEGA_COLUMN_ORDER = [
+    "Reference",
+    "Journal",
+    "publicationType",
+    "Issue year",
+    "DOI",
+    "WoSId",
+    "ScopusId",
+    "JIFQuartile",
+    "Authors MU-Varna",
+    "Link WOS",
+    "Link Scopus",
+]
+
 
 def load_omega(path: str | Path) -> pd.DataFrame:
     frame = pd.read_csv(path, dtype=str, encoding="utf-8-sig", keep_default_na=False)
@@ -68,6 +82,7 @@ def omega_records(path: str | Path) -> list[SourceRecord]:
         wos_ut = empty_to_none(row.get("WoSId"))
         scopus_id = empty_to_none(row.get("ScopusId"))
         doi = normalize_doi(row.get("DOI"))
+        original_row = {column: str(row.get(column, "")) for column in OMEGA_COLUMN_ORDER}
         records.append(
             SourceRecord(
                 source="omega",
@@ -85,7 +100,7 @@ def omega_records(path: str | Path) -> list[SourceRecord]:
                 omega_jif_quartile=normalize_quartile(row.get("JIFQuartile")),
                 omega_authors=empty_to_none(row.get("Authors MU-Varna")),
                 evidence_url=empty_to_none(row.get("Link WOS")) or empty_to_none(row.get("Link Scopus")),
-                raw={"row_number": int(idx + 2)},
+                raw={"row_number": int(idx + 2), "omega_row": original_row},
             )
         )
     return records
