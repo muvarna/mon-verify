@@ -37,6 +37,30 @@ def _provenance_url(pub: CanonicalPublication, source: str) -> str:
     return ""
 
 
+def _verified_wos_url(pub: CanonicalPublication) -> str:
+    url = _provenance_url(pub, "wos")
+    if url:
+        return url
+    uid = (pub.wos_ut or "").strip()
+    if not uid or uid.upper().startswith("RC"):
+        return ""
+    collection = "woscc" if uid.upper().startswith("WOS:") else "alldb"
+    return f"https://www.webofscience.com/wos/{collection}/full-record/{uid}"
+
+
+def _verified_scopus_url(pub: CanonicalPublication) -> str:
+    url = _provenance_url(pub, "scopus")
+    if url:
+        return url
+    eid = (pub.scopus_eid or "").strip()
+    if eid:
+        return f"https://www.scopus.com/record/display.uri?eid={eid}&origin=resultslist"
+    sid = (pub.scopus_id or "").strip()
+    if sid:
+        return f"https://www.scopus.com/inward/record.uri?scp={sid}&partnerID=HzOxMe3b&origin=inward"
+    return ""
+
+
 def _preferred_year(pub: CanonicalPublication) -> int | None:
     for source in ("wos", "scopus", "omega"):
         value = pub.source_years.get(source)
@@ -72,8 +96,14 @@ def united_verification_dataframe(publications: Iterable[CanonicalPublication]) 
         row["ScopusId"] = omega.get("ScopusId", "") if has_omega else (pub.scopus_id or pub.scopus_eid or "")
         row["JIFQuartile"] = omega.get("JIFQuartile", "") if has_omega else (pub.jif_quartile or "")
         row["Authors MU-Varna"] = omega.get("Authors MU-Varna", "") if has_omega else (pub.omega_authors or "")
-        row["Link WOS"] = omega.get("Link WOS", "") if has_omega else _provenance_url(pub, "wos")
-        row["Link Scopus"] = omega.get("Link Scopus", "") if has_omega else _provenance_url(pub, "scopus")
+
+        # The OMEGA link columns are the primary source-specific evidence fields.
+        # Prefer a verified URL produced from WoS/Scopus evidence. If that source
+        # is not verified for this publication, retain the original OMEGA link.
+        verified_wos_url = _verified_wos_url(pub)
+        verified_scopus_url = _verified_scopus_url(pub)
+        row["Link WOS"] = verified_wos_url or (omega.get("Link WOS", "") if has_omega else "")
+        row["Link Scopus"] = verified_scopus_url or (omega.get("Link Scopus", "") if has_omega else "")
 
         row["MUV authors WOS"] = "; ".join(pub.muv_authors_wos)
         row["Review group"] = _review_group(pub)
