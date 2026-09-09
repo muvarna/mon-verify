@@ -39,6 +39,7 @@ class SourceRecord(BaseModel):
     issn: str | None = None
     eissn: str | None = None
     muv_affiliation: bool | None = None
+    muv_authors: list[str] = Field(default_factory=list)
     institution_count: int | None = None
     institutions: list[str] = Field(default_factory=list)
     omega_jif_quartile: str | None = None
@@ -67,6 +68,9 @@ class CanonicalPublication(BaseModel):
     eligibility_reason: str | None = None
     muv_affiliation_wos: bool | None = None
     muv_affiliation_scopus: bool | None = None
+    omega_authors: str | None = None
+    muv_authors_wos: list[str] = Field(default_factory=list)
+    omega_original: dict[str, Any] = Field(default_factory=dict)
     omega_jif_quartile: str | None = None
     jif_quartile: str | None = None
     quartile_match_method: str | None = None
