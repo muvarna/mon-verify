@@ -1,0 +1,29 @@
+version: "2025.1"
+assessment_year: 2025
+formula:
+  a1: 5
+  a2: 3
+  a3: 2
+  a4: 1
+institution_rule:
+  threshold: 10
+  operator: ">"
+  normal_multiplier: 1.0
+  over_threshold_multiplier: 0.1
+  source_priority:
+    - wos
+    - scopus
+    - scival
+document_types:
+  include: "all"
+quartiles:
+  Q1: a1
+  Q2: a2
+  Q3: a3
+  Q4: a4
+  NONE: a4
+wos:
+  database_id: WOK
+  organization_enhanced: "Medical University Varna"
+scopus:
+  affiliation_id: "60005828"
