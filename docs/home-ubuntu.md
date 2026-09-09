@@ -32,7 +32,7 @@ WOS_API_KEY=YOUR_WOS_EXPANDED_API_KEY
 mkdir -p data/input data/raw data/output
 ```
 
-Use these names for convenience:
+Use:
 
 ```text
 data/input/omega.csv
@@ -40,15 +40,30 @@ data/input/quartiles.csv
 data/input/scival.csv
 ```
 
-The SciVal CSV should start directly with the header row. The expected standard columns are:
+The SciVal CSV may start directly with its header row. Required standard fields include:
 
 ```text
-Title,Authors,Year,Scopus Source title,ISSN,Language,Citations,DOI,Publication type,EID,Number of Institutions
+Title,Year,DOI,EID,Number of Institutions
 ```
 
-Do not include the SciVal metadata preamble or final copyright line.
+SciVal EID is used to reconcile OMEGA `ScopusId`. Matching priority is:
 
-## 4. Inspect all three inputs
+1. normalized DOI exact match;
+2. existing Scopus ID/EID exact match;
+3. exact normalized title + year when unambiguous.
+
+For a matched record the canonical values become:
+
+```text
+ScopusId = numeric Scopus ID, e.g. 85219548783
+Scopus EID = full EID, e.g. 2-s2.0-85219548783
+```
+
+The original OMEGA value is preserved separately as `Original OMEGA ScopusId`.
+
+SciVal institution count `0` is treated as missing and therefore requires manual review unless WoS supplies a positive count.
+
+## 4. Inspect inputs
 
 ```bash
 monverify inspect-omega data/input/omega.csv
@@ -56,8 +71,6 @@ monverify inspect-quartiles data/input/quartiles.csv
 monverify inspect-scival data/input/scival.csv
 monverify inspect-ministry
 ```
-
-The last command reads the versioned 2025 MON comparison claim from `config/rules_2025.yaml`; the Ministry workbook is optional.
 
 ## 5. Fetch independent WoS discovery — compact output only
 
@@ -68,10 +81,6 @@ monverify fetch-wos \
   --output data/raw/wos_2025_discovery.json
 ```
 
-`--no-cache` is important on a home computer: the full Expanded API pages are not written to the raw page cache. They are normalized in memory and the saved JSON contains only MON Verify evidence fields.
-
-Research Commons records whose UID begins with `RC` are excluded.
-
 ## 6. Verify WoS IDs already present in OMEGA
 
 ```bash
@@ -81,9 +90,7 @@ monverify fetch-wos \
   --output data/raw/wos_2025_omega_ids.json
 ```
 
-This direct-ID pass is useful because a record in OMEGA may need checking even if it was not returned by the institutional discovery query.
-
-## 7. Run the verification
+## 7. First verification run
 
 ```bash
 monverify verify \
@@ -95,7 +102,64 @@ monverify verify \
   --output-dir data/output
 ```
 
-Expected outputs:
+A record is resolved when it has a usable institution count. WoS and/or Scopus identifiers are retained as evidence. Other discrepancies can still be flagged without forcing the record into the unresolved section.
+
+`unresolved_records.csv` contains only active publications whose selected institution count is still missing, including SciVal rows with institution count `0` when WoS did not supply a count.
+
+## 8. Resolve missing institution counts manually
+
+Create an overrides file:
+
+```bash
+monverify make-overrides \
+  --omega data/input/omega.csv \
+  --quartiles data/input/quartiles.csv \
+  --scival-csv data/input/scival.csv \
+  --wos-json data/raw/wos_2025_discovery.json \
+  --wos-json data/raw/wos_2025_omega_ids.json \
+  --output data/input/manual_overrides.csv
+```
+
+Open `data/input/manual_overrides.csv` in LibreOffice/Excel and fill:
+
+```text
+manual_institution_count
+```
+
+with the positive number of institutions found manually in WoS/Scopus/SciVal.
+
+To remove a publication from the active calculation, set:
+
+```text
+remove = true
+```
+
+Optionally add a reason in:
+
+```text
+note
+```
+
+Then rerun:
+
+```bash
+monverify verify \
+  --omega data/input/omega.csv \
+  --quartiles data/input/quartiles.csv \
+  --scival-csv data/input/scival.csv \
+  --wos-json data/raw/wos_2025_discovery.json \
+  --wos-json data/raw/wos_2025_omega_ids.json \
+  --manual-overrides data/input/manual_overrides.csv \
+  --output-dir data/output
+```
+
+Removed records are excluded from the active united table/calculation but preserved in:
+
+```text
+data/output/removed_records.csv
+```
+
+## 9. Output files
 
 ```text
 data/output/canonical_publications.csv
@@ -103,48 +167,34 @@ data/output/united_verification_table.csv
 data/output/ministry_comparison.csv
 data/output/ministry_corrections.csv
 data/output/unresolved_records.csv
+data/output/removed_records.csv
 data/output/over_10_institutions.csv
 data/output/verification_summary.json
 ```
 
-## 8. Check the summary
-
-```bash
-cat data/output/verification_summary.json
-```
-
-The `calculated.raw.a1` through `a4`, `publication_count`, weighted buckets, and `a_score` are always numeric confirmed subtotals. Unresolved records are reported separately through:
+The united table is ordered:
 
 ```text
-unresolved_eligibility_count
-unresolved_eligibility_by_bucket
-unresolved_weight_count
-calculation_complete
-calculation_note
+Resolved records — source title alphabetically
+Unresolved records — source title alphabetically
 ```
 
-Thus an unresolved Q1 publication no longer turns the entire Q1 result into JSON `null`.
-
-## 9. Run tests
-
-```bash
-pytest
-```
-
-## 10. Run Streamlit after the CLI fetch
-
-The most disk-efficient approach is to fetch WoS from the CLI with `--no-cache` first, then use the compact JSON in Streamlit.
+## 10. Streamlit
 
 ```bash
 monverify ui
 ```
 
-In the app choose **Uploaded/cached JSON** and upload:
+The **Manual review** tab lets you:
 
-- `omega.csv`
-- `quartiles.csv`
-- `scival.csv`
-- `wos_2025_discovery.json`
-- `wos_2025_omega_ids.json`
+- enter a positive institution count;
+- mark any record for removal;
+- add a manual note;
+- apply the changes immediately;
+- download `manual_overrides.csv` for reuse in later runs.
 
-This avoids a second WoS retrieval and avoids persisting the large raw Expanded API responses.
+## 11. Run tests
+
+```bash
+pytest
+```
