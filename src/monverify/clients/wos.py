@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -28,8 +29,27 @@ def _get_path(obj: Any, *keys: str) -> Any:
     return cur
 
 
+def _uid(record: dict[str, Any]) -> str | None:
+    value = str(record.get("UID") or record.get("uid") or "").strip()
+    return value or None
+
+
+def is_research_commons_uid(value: object) -> bool:
+    text = str(value or "").strip().upper()
+    return bool(text) and text.startswith("RC")
+
+
+def is_research_commons_record(record: dict[str, Any]) -> bool:
+    return is_research_commons_uid(_uid(record))
+
+
 def wos_records_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    candidates = [_get_path(payload, "Data", "Records", "records", "REC"),_get_path(payload, "Data", "Records", "records"),_get_path(payload, "Data", "Records"),payload.get("records")]
+    candidates = [
+        _get_path(payload, "Data", "Records", "records", "REC"),
+        _get_path(payload, "Data", "Records", "records"),
+        _get_path(payload, "Data", "Records"),
+        payload.get("records"),
+    ]
     for value in candidates:
         if isinstance(value, list):
             return [x for x in value if isinstance(x, dict)]
@@ -67,6 +87,7 @@ def _title_of_type(record: dict[str, Any], wanted: str) -> str | None:
 
 def _find_identifier(record: dict[str, Any], types: set[str]) -> str | None:
     wanted = {x.lower() for x in types}
+
     def walk(value: Any) -> str | None:
         if isinstance(value, dict):
             type_value = str(value.get("type", "")).lower()
@@ -84,7 +105,20 @@ def _find_identifier(record: dict[str, Any], types: set[str]) -> str | None:
                 if found:
                     return found
         return None
+
     return walk(record)
+
+
+def _preferred_organizations(address: dict[str, Any]) -> list[str]:
+    organizations = _get_path(address, "address_spec", "organizations", "organization")
+    found: list[str] = []
+    for org in _as_list(organizations):
+        if not isinstance(org, dict) or str(org.get("pref", "")).upper() != "Y":
+            continue
+        name = org.get("content") or org.get("value")
+        if name:
+            found.append(str(name).strip())
+    return found
 
 
 def extract_wos_enhanced_institutions(record: dict[str, Any]) -> list[str]:
@@ -105,8 +139,102 @@ def extract_wos_enhanced_institutions(record: dict[str, Any]) -> list[str]:
     return sorted(found.values(), key=str.lower)
 
 
+def _address_number_tokens(value: Any) -> set[str]:
+    tokens: set[str] = set()
+    if value is None:
+        return tokens
+    if isinstance(value, dict):
+        for child in value.values():
+            tokens.update(_address_number_tokens(child))
+        return tokens
+    if isinstance(value, list):
+        for child in value:
+            tokens.update(_address_number_tokens(child))
+        return tokens
+    text = str(value).strip()
+    if not text:
+        return tokens
+    numbers = re.findall(r"\d+", text)
+    if numbers:
+        tokens.update(numbers)
+    else:
+        tokens.add(text)
+    return tokens
+
+
+def _author_name(item: Any) -> str | None:
+    if isinstance(item, str):
+        return item.strip() or None
+    if not isinstance(item, dict):
+        return None
+    role = str(item.get("role") or "").strip().lower()
+    if role and role not in {"author"}:
+        return None
+    for key in ("display_name", "full_name", "wos_standard", "content", "value"):
+        value = item.get(key)
+        if value:
+            return str(value).strip() or None
+    first = str(item.get("first_name") or "").strip()
+    last = str(item.get("last_name") or "").strip()
+    if first or last:
+        return " ".join(x for x in (first, last) if x).strip() or None
+    return None
+
+
+def _names_from_container(container: Any) -> list[Any]:
+    if not isinstance(container, dict):
+        return []
+    names = container.get("names")
+    if isinstance(names, dict):
+        return _as_list(names.get("name"))
+    if isinstance(names, list):
+        return names
+    name = container.get("name")
+    return _as_list(name) if name is not None else []
+
+
+def extract_wos_muv_authors(record: dict[str, Any], organization: str = "Medical University Varna") -> list[str]:
+    """Extract authors linked by WoS address numbers to the MU-Varna enhanced organization."""
+    organization_key = normalize_title(organization)
+    addresses = _get_path(record, "static_data", "fullrecord_metadata", "addresses", "address_name")
+    muv_addr_numbers: set[str] = set()
+    found: dict[str, str] = {}
+
+    for address in _as_list(addresses):
+        if not isinstance(address, dict):
+            continue
+        preferred = _preferred_organizations(address)
+        if not any(normalize_title(name) == organization_key for name in preferred):
+            continue
+        address_spec = address.get("address_spec") if isinstance(address.get("address_spec"), dict) else {}
+        muv_addr_numbers.update(_address_number_tokens(address.get("addr_no")))
+        muv_addr_numbers.update(_address_number_tokens(address_spec.get("addr_no")))
+
+        # Some Expanded records list the associated authors directly under the address.
+        direct_names = _names_from_container(address) + _names_from_container(address_spec)
+        for item in direct_names:
+            name = _author_name(item)
+            if name:
+                found[name.casefold()] = name
+
+    # Most modern records associate summary authors and addresses using addr_no.
+    summary_names = _get_path(record, "static_data", "summary", "names", "name")
+    if muv_addr_numbers:
+        for item in _as_list(summary_names):
+            if not isinstance(item, dict):
+                continue
+            author_addr_numbers = _address_number_tokens(item.get("addr_no"))
+            if not author_addr_numbers.intersection(muv_addr_numbers):
+                continue
+            name = _author_name(item)
+            if name:
+                found[name.casefold()] = name
+
+    return list(found.values())
+
+
 def normalize_wos_record(record: dict[str, Any], organization: str = "Medical University Varna") -> SourceRecord:
-    uid = str(record.get("UID") or record.get("uid") or "").strip() or None
+    uid = _uid(record)
     title = _title_of_type(record, "item")
     source_title = _title_of_type(record, "source")
     pub_info = _get_path(record, "static_data", "summary", "pub_info") or {}
@@ -120,6 +248,7 @@ def normalize_wos_record(record: dict[str, Any], organization: str = "Medical Un
     institutions = extract_wos_enhanced_institutions(record)
     organization_key = normalize_title(organization)
     muv = any(normalize_title(x) == organization_key for x in institutions) if institutions else None
+    muv_authors = extract_wos_muv_authors(record, organization=organization)
     doi = normalize_doi(_find_identifier(record, {"doi"}))
     issn = normalize_issn(_find_identifier(record, {"issn"}))
     eissn = normalize_issn(_find_identifier(record, {"eissn", "e-issn"}))
@@ -128,13 +257,38 @@ def normalize_wos_record(record: dict[str, Any], organization: str = "Medical Un
         evidence_url = f"https://www.webofscience.com/wos/{collection}/full-record/{uid}"
     else:
         evidence_url = None
-    return SourceRecord(source="wos",source_id=uid or f"wos:{normalize_title(title) or 'unknown'}",doi=doi,wos_ut=uid,title=title,normalized_title=normalize_title(title),year=year,document_type="; ".join(doc_list) if doc_list else None,source_title=source_title,issn=issn,eissn=eissn,muv_affiliation=muv,institution_count=len(institutions) if institutions else None,institutions=institutions,evidence_url=evidence_url,raw=record)
+    return SourceRecord(
+        source="wos",
+        source_id=uid or f"wos:{normalize_title(title) or 'unknown'}",
+        doi=doi,
+        wos_ut=uid,
+        title=title,
+        normalized_title=normalize_title(title),
+        year=year,
+        document_type="; ".join(doc_list) if doc_list else None,
+        source_title=source_title,
+        issn=issn,
+        eissn=eissn,
+        muv_affiliation=muv,
+        muv_authors=muv_authors,
+        institution_count=len(institutions) if institutions else None,
+        institutions=institutions,
+        evidence_url=evidence_url,
+        raw=record,
+    )
 
 
 class WOSClient:
-    def __init__(self, api_key: str, *, base_url: str = "https://api.clarivate.com/api/wos/", cache_dir: str | Path = "data/raw/wos", session: requests.Session | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        base_url: str = "https://api.clarivate.com/api/wos/",
+        cache_dir: str | Path = "data/raw/wos",
+        session: requests.Session | None = None,
+    ) -> None:
         if not api_key:
-            raise ValueError("WOS API key is required")
+            raise ValueError("WoS API key is required")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/") + "/"
         self.cache_dir = Path(cache_dir)
@@ -144,7 +298,15 @@ class WOSClient:
     def headers(self) -> dict[str, str]:
         return {"X-ApiKey": self.api_key, "Accept": "application/json"}
 
-    def search_pages(self, query: str, *, database_id: str = "WOS", count: int = 100, use_cache: bool = True, max_records: int | None = None) -> list[dict[str, Any]]:
+    def search_pages(
+        self,
+        query: str,
+        *,
+        database_id: str = "WOS",
+        count: int = 100,
+        use_cache: bool = True,
+        max_records: int | None = None,
+    ) -> list[dict[str, Any]]:
         if count < 1 or count > 100:
             raise ValueError("WoS Expanded count must be between 1 and 100")
         pages: list[dict[str, Any]] = []
@@ -157,7 +319,13 @@ class WOSClient:
             page_count = count if max_records is None else min(count, max_records - retrieved)
             if page_count <= 0:
                 break
-            params = {"databaseId": database_id,"usrQuery": query,"count": page_count,"firstRecord": first_record,"lang": "en"}
+            params = {
+                "databaseId": database_id,
+                "usrQuery": query,
+                "count": page_count,
+                "firstRecord": first_record,
+                "lang": "en",
+            }
             cache_path = self.cache_dir / cache_key("search", params)
             if use_cache and cache_path.exists():
                 payload = read_json(cache_path)
@@ -177,11 +345,22 @@ class WOSClient:
                 break
         return pages
 
-    def get_by_ids(self, unique_ids: Iterable[str], *, database_id: str = "WOK", batch_size: int = 100, use_cache: bool = True) -> list[dict[str, Any]]:
-        ids = [str(x).strip() for x in unique_ids if str(x).strip()]
+    def get_by_ids(
+        self,
+        unique_ids: Iterable[str],
+        *,
+        database_id: str = "WOK",
+        batch_size: int = 100,
+        use_cache: bool = True,
+    ) -> list[dict[str, Any]]:
+        ids = [
+            str(x).strip()
+            for x in unique_ids
+            if str(x).strip() and not is_research_commons_uid(str(x).strip())
+        ]
         pages: list[dict[str, Any]] = []
         for pos in range(0, len(ids), batch_size):
-            batch = ids[pos:pos + batch_size]
+            batch = ids[pos : pos + batch_size]
             params = {"databaseId": database_id, "count": max(1, len(batch)), "firstRecord": 1}
             url = self.base_url.rstrip("/") + "/id/" + ",".join(batch)
             cache_params = {"ids": batch, **params}
@@ -197,4 +376,9 @@ class WOSClient:
 
     def search_records(self, query: str, **kwargs: Any) -> list[SourceRecord]:
         pages = self.search_pages(query, **kwargs)
-        return [normalize_wos_record(record) for page in pages for record in wos_records_from_payload(page)]
+        return [
+            normalize_wos_record(record)
+            for page in pages
+            for record in wos_records_from_payload(page)
+            if not is_research_commons_record(record)
+        ]
