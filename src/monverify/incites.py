@@ -49,12 +49,23 @@ class QuartileIndex:
 
     def _resolve(self, indices: list[int], method: str) -> QuartileMatch:
         rows = self.frame.loc[indices]
-        quartiles = sorted({q for q in rows["_quartile"].tolist() if q})
+        # Re-normalize here because pandas may coerce None values produced by
+        # Series.map() back to floating NaN. NaN is truthy, so filtering with
+        # `if q` alone can incorrectly treat it as a real quartile.
+        quartiles = sorted(
+            {
+                normalized
+                for raw in rows["_quartile"].tolist()
+                if (normalized := normalize_quartile(raw)) is not None
+            }
+        )
+        matched_name = normalize_title(rows.iloc[0]["Name"])
+        display_name = str(rows.iloc[0]["Name"]) if matched_name else None
         if len(quartiles) == 1:
-            return QuartileMatch(quartiles[0], method, "confirmed", str(rows.iloc[0]["Name"]), 100.0)
+            return QuartileMatch(quartiles[0], method, "confirmed", display_name, 100.0)
         if len(quartiles) == 0:
-            return QuartileMatch(None, method, "confirmed", str(rows.iloc[0]["Name"]), 100.0)
-        return QuartileMatch(None, method, "ambiguous", str(rows.iloc[0]["Name"]), 100.0)
+            return QuartileMatch(None, method, "confirmed", display_name, 100.0)
+        return QuartileMatch(None, method, "ambiguous", display_name, 100.0)
 
     def match(self, issn: str | None, eissn: str | None, title: str | None, fuzzy_threshold: float = 94.0) -> QuartileMatch:
         for method, raw, index in (("issn", issn, self._issn), ("eissn", eissn, self._eissn)):
