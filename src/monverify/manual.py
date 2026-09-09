@@ -7,12 +7,7 @@ import pandas as pd
 from .models import CanonicalPublication
 from .rules import RuleEngine
 
-OVERRIDE_COLUMNS = [
-    "canonical_id",
-    "manual_institution_count",
-    "remove",
-    "note",
-]
+OVERRIDE_COLUMNS = ["canonical_id", "manual_institution_count", "remove", "note"]
 
 
 def load_manual_overrides(path: str | Path | None) -> dict[str, dict[str, object]]:
@@ -45,11 +40,7 @@ def load_manual_overrides(path: str | Path | None) -> dict[str, dict[str, object
     return out
 
 
-def apply_manual_overrides(
-    publications: list[CanonicalPublication],
-    rules: RuleEngine,
-    overrides: dict[str, dict[str, object]],
-) -> list[CanonicalPublication]:
+def apply_manual_overrides(publications: list[CanonicalPublication], rules: RuleEngine, overrides: dict[str, dict[str, object]]) -> list[CanonicalPublication]:
     for pub in publications:
         override = overrides.get(pub.canonical_id)
         if not override:
@@ -70,14 +61,10 @@ def apply_manual_overrides(
             pub.over_10_institutions = rules.is_over_threshold(count)
             pub.contribution_multiplier = rules.multiplier(count)
             pub.weighted_contribution = pub.contribution_multiplier
-            pub.score_contribution = (
-                pub.contribution_multiplier * rules.bucket_weight(pub.ministry_bucket or "a4")
-                if pub.contribution_multiplier is not None
-                else None
-            )
-            pub.eligible_for_calculation = bool(pub.wos_ut or pub.scopus_id or pub.scopus_eid)
-            pub.eligibility_reason = "Identifier present; institution count supplied manually"
-            pub.verification_status = "confirmed" if pub.eligible_for_calculation else "manual_review"
+            pub.score_contribution = pub.contribution_multiplier * rules.bucket_weight(pub.ministry_bucket or "a4") if pub.contribution_multiplier is not None else None
+            pub.eligible_for_calculation = True
+            pub.eligibility_reason = "Institution count supplied manually"
+            pub.verification_status = "confirmed"
             pub.discrepancy_codes = [x for x in pub.discrepancy_codes if x != "MISSING_INSTITUTION_COUNT"]
             pub.discrepancy_codes = sorted(set(pub.discrepancy_codes + ["MANUAL_INSTITUTION_COUNT"]))
     return publications
