@@ -11,10 +11,15 @@ import streamlit as st
 
 from monverify.clients.common import APIRequestError
 from monverify.clients.scopus import ScopusClient, scopus_entries_from_payload
-from monverify.clients.wos import WOSClient, wos_records_from_payload
+from monverify.clients.wos import (
+    WOSClient,
+    is_research_commons_record,
+    is_research_commons_uid,
+    wos_records_from_payload,
+)
 from monverify.ministry import parse_ministry_workbook
 from monverify.omega import omega_records
-from monverify.reporting import publications_dataframe
+from monverify.reporting import publications_dataframe, united_verification_dataframe
 from monverify.rules import RuleEngine
 from monverify.scival import inspect_scival
 from monverify.verification import aggregate, build_canonical_publications, compare_to_ministry
@@ -86,7 +91,7 @@ with st.sidebar:
     mode = st.radio("Data source", ["Uploaded/cached data", "Live APIs"])
     st.markdown("**Institution identifiers**")
     st.code(f"WoS: Medical University Varna\nWoS database: {WOS_DATABASE_ID}\nScopus AF-ID: 60005828")
-    st.caption("Institution-count priority: WoS → Scopus → SciVal")
+    st.caption("WoS Research Commons (RC prefix) is excluded. Institution-count priority: WoS → Scopus → SciVal")
 
 st.subheader("Input files")
 col1, col2, col3 = st.columns(3)
@@ -125,7 +130,7 @@ if mode == "Uploaded/cached data":
             "Optional WoS JSON files",
             type=["json"],
             accept_multiple_files=True,
-            help="Upload discovery and/or OMEGA-ID verification JSON files.",
+            help="Upload discovery and/or OMEGA-ID verification JSON files. RC-prefix Research Commons records are ignored during verification.",
         )
     with col5:
         scopus_uploads = st.file_uploader(
@@ -184,10 +189,21 @@ else:
                                     "pages": pages,
                                 }
                             )
-                            st.success(f"WoS discovery: {sum(len(wos_records_from_payload(p)) for p in pages)} record(s).")
+                            raw_records = [record for page in pages for record in wos_records_from_payload(page)]
+                            rc_count = sum(1 for record in raw_records if is_research_commons_record(record))
+                            usable_count = len(raw_records) - rc_count
+                            st.success(
+                                f"WoS discovery: {usable_count} usable record(s); {rc_count} Research Commons record(s) excluded."
+                            )
                     if "Verify OMEGA identifiers" in workflows:
                         with st.spinner("WoS: verifying OMEGA identifiers..."):
-                            ids = sorted({r.wos_ut for r in omega_source_records if r.wos_ut})
+                            ids = sorted(
+                                {
+                                    r.wos_ut
+                                    for r in omega_source_records
+                                    if r.wos_ut and not is_research_commons_uid(r.wos_ut)
+                                }
+                            )
                             pages = client.get_by_ids(ids, database_id=WOS_DATABASE_ID)
                             st.session_state["wos_live_files"].append(
                                 {
@@ -198,7 +214,7 @@ else:
                                     "pages": pages,
                                 }
                             )
-                            st.success(f"WoS OMEGA-ID verification requested {len(ids)} identifier(s).")
+                            st.success(f"WoS OMEGA-ID verification requested {len(ids)} non-RC identifier(s).")
                 except Exception as exc:
                     st.session_state["api_errors"].append({"service": "WoS", "error": str(exc)})
                     _show_api_failure("WoS", exc)
@@ -287,6 +303,7 @@ if "pubs" in st.session_state:
     agg = st.session_state["aggregate"]
     comparison = pd.DataFrame(st.session_state["comparison"])
     frame = publications_dataframe(pubs)
+    united = united_verification_dataframe(pubs)
 
     st.subheader("MON vs calculated")
     c1, c2, c3, c4 = st.columns(4)
@@ -309,19 +326,28 @@ if "pubs" in st.session_state:
     )
     st.dataframe(comparison, use_container_width=True, hide_index=True)
 
-    tabs = st.tabs(["Publications", "Discrepancies", ">10 institutions", "Unresolved", "Downloads"])
+    tabs = st.tabs(["United table", "Canonical", "Discrepancies", ">10 institutions", "Unresolved", "Downloads"])
     with tabs[0]:
-        st.dataframe(frame, use_container_width=True, hide_index=True)
+        st.caption("OMEGA-shaped output ordered Confirmed → Unresolved → Excluded.")
+        st.dataframe(united, use_container_width=True, hide_index=True)
     with tabs[1]:
+        st.dataframe(frame, use_container_width=True, hide_index=True)
+    with tabs[2]:
         discrepancies = frame[frame["discrepancy_codes"].fillna("").str.len() > 0]
         st.dataframe(discrepancies, use_container_width=True, hide_index=True)
-    with tabs[2]:
+    with tabs[3]:
         over_10 = frame[frame["over_10_institutions"] == True]  # noqa: E712
         st.dataframe(over_10, use_container_width=True, hide_index=True)
-    with tabs[3]:
+    with tabs[4]:
         unresolved = frame[frame["verification_status"] == "manual_review"]
         st.dataframe(unresolved, use_container_width=True, hide_index=True)
-    with tabs[4]:
+    with tabs[5]:
+        st.download_button(
+            "united_verification_table.csv",
+            united.to_csv(index=False).encode("utf-8-sig"),
+            "united_verification_table.csv",
+            "text/csv",
+        )
         st.download_button("canonical_publications.csv", frame.to_csv(index=False).encode("utf-8-sig"), "canonical_publications.csv", "text/csv")
         st.download_button("ministry_comparison.csv", comparison.to_csv(index=False).encode("utf-8-sig"), "ministry_comparison.csv", "text/csv")
         st.download_button("ministry_corrections.csv", discrepancies.to_csv(index=False).encode("utf-8-sig"), "ministry_corrections.csv", "text/csv")
