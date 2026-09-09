@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from .models import MinistryClaim
+
 
 class RuleEngine:
     def __init__(self, rules: dict[str, Any]):
@@ -23,6 +25,13 @@ class RuleEngine:
     @property
     def threshold(self) -> int:
         return int(self.rules["institution_rule"]["threshold"])
+
+    def ministry_claim(self) -> MinistryClaim:
+        values = dict(self.rules.get("ministry_claim") or {})
+        if not values:
+            raise ValueError("Rules file does not contain ministry_claim")
+        values["assessment_year"] = self.assessment_year
+        return MinistryClaim(**values)
 
     def is_over_threshold(self, institution_count: int | None) -> bool | None:
         if institution_count is None:
