@@ -35,13 +35,7 @@ def _detect_header_row(path: str | Path, *, required: tuple[str, ...] = ("EID", 
 
 def load_scival(path: str | Path) -> pd.DataFrame:
     header_row = _detect_header_row(path)
-    frame = pd.read_csv(
-        path,
-        skiprows=header_row,
-        dtype=str,
-        encoding="utf-8-sig",
-        keep_default_na=False,
-    )
+    frame = pd.read_csv(path, skiprows=header_row, dtype=str, encoding="utf-8-sig", keep_default_na=False)
     frame.columns = [str(c).strip() for c in frame.columns]
     if DEFAULT_SCOPUS_COLUMN in frame.columns:
         frame = frame[frame[DEFAULT_SCOPUS_COLUMN].astype(str).str.strip().ne("")].copy()
@@ -80,8 +74,6 @@ class SciValIndex:
     def __init__(self, rows: list[SciValPublication]):
         self.rows = rows
         self.by_scopus: dict[str, SciValPublication] = {}
-        self.by_doi: dict[str, SciValPublication] = {}
-        self.by_title_year: dict[str, SciValPublication] = {}
         doi_candidates: dict[str, list[SciValPublication]] = {}
         title_candidates: dict[str, list[SciValPublication]] = {}
         for row in rows:
@@ -122,12 +114,14 @@ class SciValIndex:
         return cls(rows)
 
     def match(self, *, scopus_id: object = None, doi: object = None, title: object = None, year: int | None = None) -> tuple[SciValPublication | None, str | None]:
-        sid = normalize_scopus_identifier(scopus_id)
-        if sid and sid in self.by_scopus:
-            return self.by_scopus[sid], "scopus_id"
+        # DOI is preferred over a possibly stale/wrong OMEGA Scopus ID. This lets
+        # SciVal correct OMEGA identifiers rather than accepting a conflicting ID.
         nd = normalize_doi(doi)
         if nd and nd in self.by_doi:
             return self.by_doi[nd], "doi"
+        sid = normalize_scopus_identifier(scopus_id)
+        if sid and sid in self.by_scopus:
+            return self.by_scopus[sid], "scopus_id"
         nt = normalize_title(title)
         if nt and year is not None:
             key = f"{nt}|{year}"
