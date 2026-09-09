@@ -7,11 +7,12 @@ from typing import Any, Iterable
 from .clients.wos import is_research_commons_record, normalize_wos_record, wos_records_from_payload
 from .dedup import canonical_id_for, group_records
 from .incites import QuartileIndex
+from .manual import apply_manual_overrides, load_manual_overrides
 from .models import CanonicalPublication, MinistryClaim, SourceRecord
 from .normalization import normalize_doi, normalize_title
 from .omega import omega_records
 from .rules import RuleEngine
-from .scival import load_scival_counts
+from .scival import SciValIndex, SciValPublication, normalize_scopus_identifier
 
 
 def _first(group: list[SourceRecord], attr: str, priority: tuple[str, ...] = ("wos", "omega")) -> Any:
@@ -52,7 +53,26 @@ def source_records_from_wos_json(path: str | Path, organization: str = "Medical 
     return records
 
 
-def _scival_count_for(group: list[SourceRecord], lookup: dict[tuple[str, str], int] | None) -> int | None:
+def _preferred_year(group: list[SourceRecord]) -> int | None:
+    for source in ("wos", "omega"):
+        for record in group:
+            if record.source == source and record.year is not None:
+                return record.year
+    return next((record.year for record in group if record.year is not None), None)
+
+
+def _scival_match(group: list[SourceRecord], index: SciValIndex | None) -> tuple[SciValPublication | None, str | None]:
+    if index is None:
+        return None, None
+    return index.match(
+        scopus_id=_first(group, "scopus_id"),
+        doi=_first(group, "doi"),
+        title=_first(group, "title"),
+        year=_preferred_year(group),
+    )
+
+
+def _legacy_scival_count(group: list[SourceRecord], lookup: dict[tuple[str, str], int] | None) -> int | None:
     if not lookup:
         return None
     for record in group:
@@ -63,9 +83,6 @@ def _scival_count_for(group: list[SourceRecord], lookup: dict[tuple[str, str], i
         doi = normalize_doi(record.doi)
         if doi and ("doi", doi) in lookup:
             return lookup[("doi", doi)]
-    for record in group:
-        if record.wos_ut and ("wos", record.wos_ut.upper()) in lookup:
-            return lookup[("wos", record.wos_ut.upper())]
     for record in group:
         title = normalize_title(record.title)
         if title and record.year is not None:
@@ -80,6 +97,7 @@ def merge_group(
     *,
     quartiles: QuartileIndex,
     rules: RuleEngine,
+    scival_index: SciValIndex | None = None,
     scival_lookup: dict[tuple[str, str], int] | None = None,
 ) -> CanonicalPublication:
     title = _first(group, "title")
@@ -90,26 +108,36 @@ def merge_group(
 
     wos_records = [r for r in group if r.source == "wos"]
     omega_records_ = [r for r in group if r.source == "omega"]
+    wos_count = next((r.institution_count for r in wos_records if r.institution_count is not None and r.institution_count > 0), None)
 
-    wos_count = next((r.institution_count for r in wos_records if r.institution_count is not None), None)
-    scival_count = _scival_count_for(group, scival_lookup)
+    scival_row, scival_match_method = _scival_match(group, scival_index)
+    scival_count = scival_row.institution_count if scival_row else _legacy_scival_count(group, scival_lookup)
+    original_omega_scopus_id = next((r.scopus_id for r in omega_records_ if r.scopus_id), None)
+    original_sid = normalize_scopus_identifier(original_omega_scopus_id)
+
+    if scival_row:
+        scopus_id = scival_row.scopus_id
+        scopus_eid = scival_row.eid
+    else:
+        scopus_id = normalize_scopus_identifier(_first(group, "scopus_id"))
+        scopus_eid = f"2-s2.0-{scopus_id}" if scopus_id else None
+
     if wos_count is not None:
         selected_count, count_source = wos_count, "wos"
-    elif scival_count is not None:
+    elif scival_count is not None and scival_count > 0:
         selected_count, count_source = scival_count, "scival"
     else:
         selected_count, count_source = None, None
 
     bucket = rules.bucket_for_quartile(quartile.quartile)
     multiplier = rules.multiplier(selected_count)
-    score_contribution = (multiplier * rules.bucket_weight(bucket)) if multiplier is not None else None
+    score_contribution = multiplier * rules.bucket_weight(bucket) if multiplier is not None else None
 
     omega_q = next((r.omega_jif_quartile for r in omega_records_ if r.omega_jif_quartile), None)
     omega_authors = next((r.omega_authors for r in omega_records_ if r.omega_authors), None)
     omega_original: dict[str, Any] = {}
     for record in omega_records_:
-        raw = record.raw or {}
-        row = raw.get("omega_row") if isinstance(raw, dict) else None
+        row = (record.raw or {}).get("omega_row") if isinstance(record.raw, dict) else None
         if isinstance(row, dict):
             omega_original = dict(row)
             break
@@ -128,49 +156,70 @@ def merge_group(
         discrepancies.append("QUARTILE_AMBIGUOUS")
     if wos_count is not None and scival_count is not None and wos_count != scival_count:
         discrepancies.append("INSTITUTION_COUNT_MISMATCH")
+    if scival_row and original_sid and original_sid != scival_row.scopus_id:
+        discrepancies.append("SCOPUS_ID_CORRECTED_FROM_SCIVAL")
+    elif scival_row and not original_sid:
+        discrepancies.append("SCOPUS_ID_ADDED_FROM_SCIVAL")
     if wos_records and not omega_records_:
-        discrepancies.append("WOS_ONLY")
+        discrepancies.extend(["WOS_ONLY", "MISSING_FROM_OMEGA"])
 
     years = {r.source: r.year for r in group if r.year is not None}
+    if scival_row and scival_row.year is not None:
+        years["scival"] = scival_row.year
     if len(set(years.values())) > 1:
         discrepancies.append("YEAR_MISMATCH")
 
-    muv_wos = next((r.muv_affiliation for r in wos_records if r.muv_affiliation is not None), None)
-    if muv_wos is False:
-        discrepancies.append("AFFILIATION_MISMATCH")
-
-    wos_years = [r.year for r in wos_records if r.year is not None]
-    has_target_year = any(y == rules.assessment_year for y in wos_years)
-    if wos_records and muv_wos is True and has_target_year:
-        eligible = True
-        eligibility_reason = "WoS evidence confirms MU-Varna affiliation and target year"
-    elif wos_records and muv_wos is False:
-        eligible = False
-        eligibility_reason = "WoS evidence does not confirm MU-Varna affiliation"
-    elif wos_records and wos_years and all(y != rules.assessment_year for y in wos_years):
-        eligible = False
-        eligibility_reason = "WoS year is outside assessment year"
+    wos_ut = _first(group, "wos_ut")
+    has_identifier = bool(wos_ut or scopus_id or scopus_eid)
+    eligible = True if has_identifier and selected_count is not None else None
+    if selected_count is None:
+        eligibility_reason = "Institution count missing or zero; manual review required"
+        discrepancies.append("MISSING_INSTITUTION_COUNT")
+    elif has_identifier:
+        eligibility_reason = "WoS and/or Scopus identifier present with institution count"
     else:
-        eligible = None
-        eligibility_reason = "WoS evidence is incomplete" if wos_records else "OMEGA seed has not yet been independently verified in WoS"
+        eligibility_reason = "No WoS or Scopus identifier"
+
+    status = "confirmed" if eligible is True else "manual_review"
+    if status == "confirmed" and discrepancies:
+        status = "strongly_supported"
 
     evidence_urls = sorted({r.evidence_url for r in group if r.evidence_url})
-    status = "confirmed"
-    if eligible is False:
-        status = "excluded"
-    elif eligible is None or quartile.confidence in {"manual_review", "ambiguous", "unresolved"} or selected_count is None:
-        status = "manual_review"
-    elif discrepancies:
-        status = "strongly_supported"
+    if scopus_eid:
+        evidence_urls.append(f"https://www.scopus.com/record/display.uri?eid={scopus_eid}&origin=resultslist")
+        evidence_urls = sorted(set(evidence_urls))
+
+    provenance = [
+        {
+            "source": r.source,
+            "source_id": r.source_id,
+            "year": r.year,
+            "institution_count": r.institution_count,
+            "muv_authors": r.muv_authors,
+            "evidence_url": r.evidence_url,
+        }
+        for r in group
+    ]
+    if scival_row:
+        provenance.append({
+            "source": "scival",
+            "source_id": scival_row.eid,
+            "year": scival_row.year,
+            "institution_count": scival_row.institution_count,
+            "match_method": scival_match_method,
+            "evidence_url": f"https://www.scopus.com/record/display.uri?eid={scival_row.eid}&origin=resultslist",
+        })
 
     return CanonicalPublication(
         canonical_id=canonical_id_for(group),
-        doi=_first(group, "doi"),
-        wos_ut=_first(group, "wos_ut"),
-        scopus_id=_first(group, "scopus_id"),
-        scopus_eid=_first(group, "scopus_eid"),
-        title=title,
-        normalized_title=normalize_title(title),
+        doi=_first(group, "doi") or (scival_row.doi if scival_row else None),
+        wos_ut=wos_ut,
+        scopus_id=scopus_id,
+        scopus_eid=scopus_eid,
+        original_omega_scopus_id=original_omega_scopus_id,
+        scival_match_method=scival_match_method,
+        title=title or (scival_row.title if scival_row else None),
+        normalized_title=normalize_title(title or (scival_row.title if scival_row else None)),
         source_years=years,
         document_type=_first(group, "document_type"),
         source_title=source_title,
@@ -178,11 +227,10 @@ def merge_group(
         eissn=eissn,
         in_omega=bool(omega_records_),
         in_wos=bool(wos_records),
-        in_scopus=False,
+        in_scopus=bool(scival_row or scopus_id),
         eligible_for_calculation=eligible,
         eligibility_reason=eligibility_reason,
-        muv_affiliation_wos=muv_wos,
-        muv_affiliation_scopus=None,
+        muv_affiliation_wos=next((r.muv_affiliation for r in wos_records if r.muv_affiliation is not None), None),
         omega_authors=omega_authors,
         muv_authors_wos=muv_authors_wos,
         omega_original=omega_original,
@@ -191,7 +239,6 @@ def merge_group(
         quartile_match_method=quartile.method,
         quartile_match_confidence=quartile.confidence,
         wos_institution_count=wos_count,
-        scopus_institution_count=None,
         scival_institution_count=scival_count,
         selected_institution_count=selected_count,
         institution_count_source=count_source,
@@ -203,40 +250,28 @@ def merge_group(
         discrepancy_codes=sorted(set(discrepancies)),
         verification_status=status,
         evidence_urls=evidence_urls,
-        provenance=[
-            {
-                "source": r.source,
-                "source_id": r.source_id,
-                "year": r.year,
-                "institution_count": r.institution_count,
-                "muv_authors": r.muv_authors,
-                "evidence_url": r.evidence_url,
-            }
-            for r in group
-        ],
+        provenance=provenance,
     )
 
 
 def _flag_title_identifier_conflicts(publications: list[CanonicalPublication]) -> None:
     by_title: dict[tuple[str, int | None], list[CanonicalPublication]] = {}
     for pub in publications:
-        title = pub.normalized_title
         years = [y for y in pub.source_years.values() if y is not None]
         year = years[0] if years else None
-        if title:
-            by_title.setdefault((title, year), []).append(pub)
+        if pub.normalized_title:
+            by_title.setdefault((pub.normalized_title, year), []).append(pub)
     for group in by_title.values():
         if len(group) < 2:
             continue
         dois = {normalize_doi(p.doi) for p in group if normalize_doi(p.doi)}
         wos_ids = {p.wos_ut for p in group if p.wos_ut}
+        scopus_ids = {p.scopus_id for p in group if p.scopus_id}
         for pub in group:
             if len(dois) > 1:
                 pub.discrepancy_codes = sorted(set(pub.discrepancy_codes + ["DOI_CONFLICT", "TITLE_CONFLICT"]))
-            elif len(wos_ids) > 1:
+            elif len(wos_ids) > 1 or len(scopus_ids) > 1:
                 pub.discrepancy_codes = sorted(set(pub.discrepancy_codes + ["TITLE_CONFLICT"]))
-            if "TITLE_CONFLICT" in pub.discrepancy_codes:
-                pub.verification_status = "manual_review"
 
 
 def _path_list(value: str | Path | list[str | Path] | tuple[str | Path, ...] | None) -> list[str | Path]:
@@ -254,10 +289,8 @@ def build_canonical_publications(
     rules_path: str | Path,
     wos_json: str | Path | list[str | Path] | tuple[str | Path, ...] | None = None,
     scival_csv: str | Path | None = None,
-    scival_count_column: str | None = None,
-    scival_doi_column: str | None = None,
-    scival_wos_column: str | None = None,
-    scival_scopus_column: str | None = None,
+    manual_overrides_csv: str | Path | None = None,
+    **_: object,
 ) -> list[CanonicalPublication]:
     rules = RuleEngine.from_yaml(rules_path)
     raw_records: list[SourceRecord] = omega_records(omega_path)
@@ -266,92 +299,78 @@ def build_canonical_publications(
     for path in wos_paths:
         raw_records.extend(source_records_from_wos_json(path, organization=wos_org))
 
-    scival_lookup = None
-    if scival_csv:
-        scival_lookup = load_scival_counts(
-            scival_csv,
-            count_column=scival_count_column,
-            doi_column=scival_doi_column,
-            wos_column=scival_wos_column,
-            scopus_column=scival_scopus_column,
-        )
-
+    scival_index = SciValIndex.from_csv(scival_csv) if scival_csv else None
     quartile_index = QuartileIndex.from_csv(quartiles_path)
     groups = group_records(raw_records)
-    publications = [merge_group(g, quartiles=quartile_index, rules=rules, scival_lookup=scival_lookup) for g in groups]
+    publications = [merge_group(g, quartiles=quartile_index, rules=rules, scival_index=scival_index) for g in groups]
+
     wos_attempted = bool(wos_paths)
     for pub in publications:
-        if not pub.in_omega and pub.in_wos:
-            pub.discrepancy_codes = sorted(set(pub.discrepancy_codes + ["MISSING_FROM_OMEGA", "WOS_ONLY"]))
-        if wos_attempted and pub.in_omega and not pub.in_wos:
-            pub.discrepancy_codes = sorted(set(pub.discrepancy_codes + ["OMEGA_ONLY"]))
-            if pub.wos_ut:
-                pub.discrepancy_codes = sorted(set(pub.discrepancy_codes + ["NOT_FOUND_IN_API"]))
+        if wos_attempted and pub.in_omega and not pub.in_wos and pub.wos_ut:
+            pub.discrepancy_codes = sorted(set(pub.discrepancy_codes + ["NOT_FOUND_IN_WOS_API"]))
+
     _flag_title_identifier_conflicts(publications)
-    return sorted(publications, key=lambda x: ((x.title or "").lower(), x.canonical_id))
+    if manual_overrides_csv:
+        publications = apply_manual_overrides(publications, rules, load_manual_overrides(manual_overrides_csv))
+
+    return sorted(
+        publications,
+        key=lambda x: (
+            1 if x.manually_removed else 0,
+            1 if x.selected_institution_count is None else 0,
+            (x.source_title or "").casefold(),
+            (x.title or "").casefold(),
+            x.canonical_id,
+        ),
+    )
 
 
 def aggregate(publications: Iterable[CanonicalPublication], rules: RuleEngine) -> dict[str, Any]:
-    """Return numeric confirmed subtotals even while some records remain unresolved.
-
-    Previous versions returned null for an entire bucket whenever that bucket also
-    contained an unresolved publication. That made the Streamlit summary unusable.
-    This function now always reports the auditable confirmed subtotal and separately
-    reports unresolved eligibility/weight counts plus completeness flags.
-    """
     pubs = list(publications)
     buckets = ("a1", "a2", "a3", "a4")
     raw = {bucket: 0 for bucket in buckets}
-    unresolved_eligibility = {bucket: 0 for bucket in buckets}
     weighted = {bucket: 0.0 for bucket in buckets}
-    unresolved_weight = {bucket: 0 for bucket in buckets}
+    unresolved = {bucket: 0 for bucket in buckets}
     over_10 = {bucket: 0 for bucket in buckets}
-    excluded = 0
+    removed = 0
 
     for pub in pubs:
+        if pub.manually_removed:
+            removed += 1
+            continue
         bucket = pub.ministry_bucket if pub.ministry_bucket in buckets else "a4"
-        if pub.eligible_for_calculation is False:
-            excluded += 1
+        if pub.selected_institution_count is None:
+            unresolved[bucket] += 1
             continue
-        if pub.eligible_for_calculation is None:
-            unresolved_eligibility[bucket] += 1
-            continue
-
         raw[bucket] += 1
-        if pub.weighted_contribution is None:
-            unresolved_weight[bucket] += 1
-        else:
-            weighted[bucket] += float(pub.weighted_contribution)
+        weighted[bucket] += float(pub.weighted_contribution or 0.0)
         if pub.over_10_institutions is True:
             over_10[bucket] += 1
 
     weighted = {k: round(v, 10) for k, v in weighted.items()}
     publication_count = sum(raw.values())
-    a_score = rules.score(weighted)
-    eligibility_complete = sum(unresolved_eligibility.values()) == 0
-    weight_complete = sum(unresolved_weight.values()) == 0
-
+    a_score = round(float(rules.score(weighted)), 10)
+    unresolved_count = sum(unresolved.values())
     return {
         "candidate_publication_count": len(pubs),
         "publication_count": publication_count,
         "confirmed_publication_count": publication_count,
-        "excluded_publication_count": excluded,
-        "unresolved_eligibility_count": sum(unresolved_eligibility.values()),
+        "excluded_publication_count": removed,
+        "removed_publication_count": removed,
+        "unresolved_eligibility_count": unresolved_count,
+        "unresolved_institution_count": unresolved_count,
         "raw": raw,
         "raw_confirmed": dict(raw),
-        "unresolved_eligibility_by_bucket": unresolved_eligibility,
+        "unresolved_eligibility_by_bucket": unresolved,
         "weighted": weighted,
         "weighted_known": dict(weighted),
-        "unresolved_weight_count": unresolved_weight,
+        "unresolved_weight_count": dict(unresolved),
         "over_10": over_10,
-        "a_score": round(float(a_score), 10),
-        "calculation_complete": eligibility_complete and weight_complete,
-        "eligibility_complete": eligibility_complete,
-        "weight_complete": weight_complete,
-        "calculation_note": (
-            "Complete calculation" if eligibility_complete and weight_complete
-            else "Confirmed subtotal only; unresolved records are reported separately"
-        ),
+        "a_score": a_score,
+        "calculation_complete": unresolved_count == 0,
+        "eligibility_complete": unresolved_count == 0,
+        "weight_complete": unresolved_count == 0,
+        "calculation_note": "Complete calculation" if unresolved_count == 0 else "Confirmed subtotal only; unresolved records lack institution counts",
     }
 
 
