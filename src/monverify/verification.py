@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .clients.scopus import normalize_scopus_abstract, normalize_scopus_entry, scopus_entries_from_payload
-from .clients.wos import normalize_wos_record, wos_records_from_payload
+from .clients.wos import is_research_commons_record, normalize_wos_record, wos_records_from_payload
 from .dedup import canonical_id_for, group_records
 from .incites import QuartileIndex
 from .models import CanonicalPublication, MinistryClaim, SourceRecord
@@ -44,6 +44,7 @@ def source_records_from_wos_json(path: str | Path, organization: str = "Medical 
         if isinstance(pages, list)
         else wos_records_from_payload(payload)
     )
+    raw_records = [record for record in raw_records if not is_research_commons_record(record)]
     records = [normalize_wos_record(record, organization=organization) for record in raw_records]
     if query_affiliation_evidence:
         for record in records:
@@ -136,6 +137,19 @@ def merge_group(
     score_contribution = (multiplier * rules.bucket_weight(bucket)) if multiplier is not None else None
 
     omega_q = next((r.omega_jif_quartile for r in omega_records_ if r.omega_jif_quartile), None)
+    omega_authors = next((r.omega_authors for r in omega_records_ if r.omega_authors), None)
+    omega_original: dict[str, Any] = {}
+    for record in omega_records_:
+        raw = record.raw or {}
+        row = raw.get("omega_row") if isinstance(raw, dict) else None
+        if isinstance(row, dict):
+            omega_original = dict(row)
+            break
+    muv_authors_wos = sorted(
+        {name.strip() for record in wos_records for name in record.muv_authors if name and name.strip()},
+        key=str.lower,
+    )
+
     discrepancies: list[str] = []
     if omega_q and quartile.quartile and omega_q != quartile.quartile:
         discrepancies.append("QUARTILE_MISMATCH")
@@ -209,6 +223,9 @@ def merge_group(
         eligibility_reason=eligibility_reason,
         muv_affiliation_wos=muv_wos,
         muv_affiliation_scopus=muv_scopus,
+        omega_authors=omega_authors,
+        muv_authors_wos=muv_authors_wos,
+        omega_original=omega_original,
         omega_jif_quartile=omega_q,
         jif_quartile=quartile.quartile,
         quartile_match_method=quartile.method,
@@ -232,6 +249,7 @@ def merge_group(
                 "source_id": r.source_id,
                 "year": r.year,
                 "institution_count": r.institution_count,
+                "muv_authors": r.muv_authors,
                 "evidence_url": r.evidence_url,
             }
             for r in group
