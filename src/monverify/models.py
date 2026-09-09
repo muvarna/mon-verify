@@ -54,6 +54,8 @@ class CanonicalPublication(BaseModel):
     wos_ut: str | None = None
     scopus_id: str | None = None
     scopus_eid: str | None = None
+    original_omega_scopus_id: str | None = None
+    scival_match_method: str | None = None
     title: str | None = None
     normalized_title: str | None = None
     source_years: dict[str, int | None] = Field(default_factory=dict)
@@ -78,6 +80,7 @@ class CanonicalPublication(BaseModel):
     wos_institution_count: int | None = None
     scopus_institution_count: int | None = None
     scival_institution_count: int | None = None
+    manual_institution_count: int | None = None
     selected_institution_count: int | None = None
     institution_count_source: str | None = None
     over_10_institutions: bool | None = None
@@ -85,6 +88,8 @@ class CanonicalPublication(BaseModel):
     contribution_multiplier: float | None = None
     weighted_contribution: float | None = None
     score_contribution: float | None = None
+    manually_removed: bool = False
+    manual_note: str | None = None
     discrepancy_codes: list[str] = Field(default_factory=list)
     verification_status: str = "manual_review"
     evidence_urls: list[str] = Field(default_factory=list)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -15,7 +16,6 @@ DEFAULT_YEAR_COLUMN = "Year"
 
 
 def _detect_header_row(path: str | Path, *, required: tuple[str, ...] = ("EID", "Number of Institutions")) -> int:
-    """Return the zero-based row containing the actual SciVal table header."""
     with Path(path).open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
         for index, line in enumerate(handle):
             if index > 100:
@@ -34,15 +34,9 @@ def _detect_header_row(path: str | Path, *, required: tuple[str, ...] = ("EID", 
 
 
 def load_scival(path: str | Path) -> pd.DataFrame:
-    """Load a SciVal publication export, automatically skipping its metadata preamble."""
     header_row = _detect_header_row(path)
-    frame = pd.read_csv(
-        path,
-        skiprows=header_row,
-        dtype=str,
-        encoding="utf-8-sig",
-        keep_default_na=False,
-    )
+    frame = pd.read_csv(path, skiprows=header_row, dtype=str, encoding="utf-8-sig", keep_default_na=False)
+    frame.columns = [str(c).strip() for c in frame.columns]
     if DEFAULT_SCOPUS_COLUMN in frame.columns:
         frame = frame[frame[DEFAULT_SCOPUS_COLUMN].astype(str).str.strip().ne("")].copy()
     return frame.reset_index(drop=True)
@@ -60,84 +54,94 @@ def normalize_scopus_identifier(value: object) -> str | None:
     return text or None
 
 
-def load_scival_counts(
-    path: str | Path,
-    *,
-    count_column: str | None = None,
-    doi_column: str | None = None,
-    wos_column: str | None = None,
-    scopus_column: str | None = None,
-    title_column: str | None = None,
-    year_column: str | None = None,
-) -> dict[tuple[str, str], int]:
-    """Load institution counts from SciVal.
+def canonical_scopus_eid(value: object) -> str | None:
+    sid = normalize_scopus_identifier(value)
+    return f"2-s2.0-{sid}" if sid else None
 
-    The standard MU-Varna SciVal export is auto-detected. Matching keys are built
-    for Scopus EID/ID and DOI. Exact normalized title + year is indexed only when
-    unambiguous.
-    """
-    frame = load_scival(path)
-    count_column = count_column or DEFAULT_COUNT_COLUMN
-    doi_column = doi_column or (DEFAULT_DOI_COLUMN if DEFAULT_DOI_COLUMN in frame.columns else None)
-    scopus_column = scopus_column or (DEFAULT_SCOPUS_COLUMN if DEFAULT_SCOPUS_COLUMN in frame.columns else None)
-    title_column = title_column or (DEFAULT_TITLE_COLUMN if DEFAULT_TITLE_COLUMN in frame.columns else None)
-    year_column = year_column or (DEFAULT_YEAR_COLUMN if DEFAULT_YEAR_COLUMN in frame.columns else None)
 
-    for column in [count_column, doi_column, wos_column, scopus_column, title_column, year_column]:
-        if column and column not in frame.columns:
-            raise ValueError(f"SciVal CSV missing requested column: {column}")
-    if not any([doi_column, wos_column, scopus_column, title_column]):
-        raise ValueError("SciVal export has no usable publication identifier columns")
+@dataclass(frozen=True)
+class SciValPublication:
+    eid: str
+    scopus_id: str
+    doi: str | None
+    title: str | None
+    normalized_title: str | None
+    year: int | None
+    institution_count: int | None
 
+
+class SciValIndex:
+    def __init__(self, rows: list[SciValPublication]):
+        self.rows = rows
+        self.by_scopus: dict[str, SciValPublication] = {}
+        doi_candidates: dict[str, list[SciValPublication]] = {}
+        title_candidates: dict[str, list[SciValPublication]] = {}
+        for row in rows:
+            self.by_scopus[row.scopus_id] = row
+            self.by_scopus[row.eid] = row
+            if row.doi:
+                doi_candidates.setdefault(row.doi, []).append(row)
+            if row.normalized_title and row.year is not None:
+                title_candidates.setdefault(f"{row.normalized_title}|{row.year}", []).append(row)
+        self.by_doi = {k: v[0] for k, v in doi_candidates.items() if len(v) == 1}
+        self.by_title_year = {k: v[0] for k, v in title_candidates.items() if len(v) == 1}
+
+    @classmethod
+    def from_csv(cls, path: str | Path) -> "SciValIndex":
+        frame = load_scival(path)
+        rows: list[SciValPublication] = []
+        for _, row in frame.iterrows():
+            sid = normalize_scopus_identifier(row.get(DEFAULT_SCOPUS_COLUMN))
+            if not sid:
+                continue
+            eid = f"2-s2.0-{sid}"
+            doi = normalize_doi(row.get(DEFAULT_DOI_COLUMN))
+            title = empty_to_none(row.get(DEFAULT_TITLE_COLUMN))
+            normalized_title = normalize_title(title)
+            year_text = empty_to_none(row.get(DEFAULT_YEAR_COLUMN))
+            try:
+                year = int(float(str(year_text))) if year_text else None
+            except ValueError:
+                year = None
+            count_text = empty_to_none(row.get(DEFAULT_COUNT_COLUMN))
+            try:
+                count = int(float(str(count_text).replace(",", "").strip())) if count_text else None
+            except ValueError:
+                count = None
+            if count is not None and count <= 0:
+                count = None
+            rows.append(SciValPublication(eid, sid, doi, title, normalized_title, year, count))
+        return cls(rows)
+
+    def match(self, *, scopus_id: object = None, doi: object = None, title: object = None, year: int | None = None) -> tuple[SciValPublication | None, str | None]:
+        # DOI is preferred over a possibly stale/wrong OMEGA Scopus ID. This lets
+        # SciVal correct OMEGA identifiers rather than accepting a conflicting ID.
+        nd = normalize_doi(doi)
+        if nd and nd in self.by_doi:
+            return self.by_doi[nd], "doi"
+        sid = normalize_scopus_identifier(scopus_id)
+        if sid and sid in self.by_scopus:
+            return self.by_scopus[sid], "scopus_id"
+        nt = normalize_title(title)
+        if nt and year is not None:
+            key = f"{nt}|{year}"
+            if key in self.by_title_year:
+                return self.by_title_year[key], "title_year"
+        return None, None
+
+
+def load_scival_counts(path: str | Path, **_: object) -> dict[tuple[str, str], int]:
+    index = SciValIndex.from_csv(path)
     out: dict[tuple[str, str], int] = {}
-    title_year_candidates: dict[str, set[int]] = {}
-
-    for _, row in frame.iterrows():
-        count_text = empty_to_none(row.get(count_column))
-        if not count_text:
+    for row in index.rows:
+        if row.institution_count is None:
             continue
-        try:
-            count = int(float(str(count_text).replace(",", "").strip()))
-        except ValueError as exc:
-            raise ValueError(f"Invalid SciVal institution count: {count_text!r}") from exc
-        if count < 1:
-            continue
-
-        if doi_column:
-            doi = normalize_doi(row.get(doi_column))
-            if doi:
-                out[("doi", doi)] = count
-
-        if wos_column:
-            value = empty_to_none(row.get(wos_column))
-            if value:
-                out[("wos", str(value).upper())] = count
-
-        if scopus_column:
-            raw = empty_to_none(row.get(scopus_column))
-            if raw:
-                raw_text = str(raw).strip()
-                out[("scopus", raw_text)] = count
-                sid = normalize_scopus_identifier(raw_text)
-                if sid:
-                    out[("scopus", sid)] = count
-                    out[("scopus", f"2-s2.0-{sid}")] = count
-
-        if title_column and year_column:
-            title = normalize_title(row.get(title_column))
-            year_text = empty_to_none(row.get(year_column))
-            if title and year_text:
-                try:
-                    year = int(float(str(year_text)))
-                except ValueError:
-                    year = None
-                if year is not None:
-                    key = f"{title}|{year}"
-                    title_year_candidates.setdefault(key, set()).add(count)
-
-    for key, counts in title_year_candidates.items():
-        if len(counts) == 1:
-            out[("title_year", key)] = next(iter(counts))
+        out[("scopus", row.scopus_id)] = row.institution_count
+        out[("scopus", row.eid)] = row.institution_count
+        if row.doi:
+            out[("doi", row.doi)] = row.institution_count
+        if row.normalized_title and row.year is not None:
+            out[("title_year", f"{row.normalized_title}|{row.year}")] = row.institution_count
     return out
 
 
@@ -150,6 +154,7 @@ def inspect_scival(path: str | Path) -> dict[str, object]:
         "year_values": sorted({x for x in frame.get(DEFAULT_YEAR_COLUMN, pd.Series(dtype=str)).astype(str) if x}),
         "with_doi": int(frame.get(DEFAULT_DOI_COLUMN, pd.Series(dtype=str)).astype(str).str.strip().replace("-", "").ne("").sum()),
         "with_eid": int(frame.get(DEFAULT_SCOPUS_COLUMN, pd.Series(dtype=str)).astype(str).str.strip().ne("").sum()),
+        "zero_or_missing_institutions": int((counts.fillna(0) <= 0).sum()),
         "over_10_institutions": int((counts > 10).sum()),
         "max_institutions": int(counts.max()) if counts.notna().any() else None,
     }
