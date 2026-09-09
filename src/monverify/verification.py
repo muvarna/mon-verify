@@ -39,7 +39,11 @@ def source_records_from_wos_json(path: str | Path, organization: str = "Medical 
     query = str(payload.get("query", "")) if isinstance(payload, dict) else ""
     query_affiliation_evidence = "OG=" in query.upper() and organization.lower() in query.lower()
     pages = payload.get("pages") if isinstance(payload, dict) else None
-    raw_records = ([record for page in pages if isinstance(page, dict) for record in wos_records_from_payload(page)] if isinstance(pages, list) else wos_records_from_payload(payload))
+    raw_records = (
+        [record for page in pages if isinstance(page, dict) for record in wos_records_from_payload(page)]
+        if isinstance(pages, list)
+        else wos_records_from_payload(payload)
+    )
     records = [normalize_wos_record(record, organization=organization) for record in raw_records]
     if query_affiliation_evidence:
         for record in records:
@@ -54,10 +58,18 @@ def source_records_from_scopus_json(path: str | Path, affiliation_id: str = "600
     query_affiliation_evidence = f"AF-ID({affiliation_id})".replace(" ", "").lower() in query.replace(" ", "").lower()
     abstracts = payload.get("abstracts") if isinstance(payload, dict) else None
     if isinstance(abstracts, list):
-        records = [normalize_scopus_abstract(item, affiliation_id=affiliation_id) for item in abstracts if isinstance(item, dict) and not item.get("_monverify_error")]
+        records = [
+            normalize_scopus_abstract(item, affiliation_id=affiliation_id)
+            for item in abstracts
+            if isinstance(item, dict) and not item.get("_monverify_error")
+        ]
     else:
         pages = payload.get("pages") if isinstance(payload, dict) else None
-        raw_entries = ([entry for page in pages if isinstance(page, dict) for entry in scopus_entries_from_payload(page)] if isinstance(pages, list) else scopus_entries_from_payload(payload))
+        raw_entries = (
+            [entry for page in pages if isinstance(page, dict) for entry in scopus_entries_from_payload(page)]
+            if isinstance(pages, list)
+            else scopus_entries_from_payload(payload)
+        )
         records = [normalize_scopus_entry(entry, affiliation_id=affiliation_id) for entry in raw_entries]
     if query_affiliation_evidence:
         for record in records:
@@ -70,29 +82,46 @@ def _scival_count_for(group: list[SourceRecord], lookup: dict[tuple[str, str], i
     if not lookup:
         return None
     for record in group:
-        doi = normalize_doi(record.doi)
-        if doi and ("doi", doi) in lookup:
-            return lookup[("doi", doi)]
-        if record.wos_ut and ("wos", record.wos_ut.upper()) in lookup:
-            return lookup[("wos", record.wos_ut.upper())]
         for sid in (record.scopus_eid, record.scopus_id):
             if sid and ("scopus", sid) in lookup:
                 return lookup[("scopus", sid)]
+    for record in group:
+        doi = normalize_doi(record.doi)
+        if doi and ("doi", doi) in lookup:
+            return lookup[("doi", doi)]
+    for record in group:
+        if record.wos_ut and ("wos", record.wos_ut.upper()) in lookup:
+            return lookup[("wos", record.wos_ut.upper())]
+    for record in group:
+        title = normalize_title(record.title)
+        if title and record.year is not None:
+            key = f"{title}|{record.year}"
+            if ("title_year", key) in lookup:
+                return lookup[("title_year", key)]
     return None
 
 
-def merge_group(group: list[SourceRecord], *, quartiles: QuartileIndex, rules: RuleEngine, scival_lookup: dict[tuple[str, str], int] | None = None) -> CanonicalPublication:
+def merge_group(
+    group: list[SourceRecord],
+    *,
+    quartiles: QuartileIndex,
+    rules: RuleEngine,
+    scival_lookup: dict[tuple[str, str], int] | None = None,
+) -> CanonicalPublication:
     title = _first(group, "title")
     issn = _first(group, "issn")
     eissn = _first(group, "eissn")
     source_title = _first(group, "source_title")
     quartile = quartiles.match(issn, eissn, source_title)
+
     wos_records = [r for r in group if r.source == "wos"]
     scopus_records = [r for r in group if r.source == "scopus"]
     omega_records_ = [r for r in group if r.source == "omega"]
+
     wos_count = next((r.institution_count for r in wos_records if r.institution_count is not None), None)
     scopus_count = next((r.institution_count for r in scopus_records if r.institution_count is not None), None)
     scival_count = _scival_count_for(group, scival_lookup)
+
     if wos_count is not None:
         selected_count, count_source = wos_count, "wos"
     elif scopus_count is not None:
@@ -101,9 +130,11 @@ def merge_group(group: list[SourceRecord], *, quartiles: QuartileIndex, rules: R
         selected_count, count_source = scival_count, "scival"
     else:
         selected_count, count_source = None, None
+
     bucket = rules.bucket_for_quartile(quartile.quartile)
     multiplier = rules.multiplier(selected_count)
     score_contribution = (multiplier * rules.bucket_weight(bucket)) if multiplier is not None else None
+
     omega_q = next((r.omega_jif_quartile for r in omega_records_ if r.omega_jif_quartile), None)
     discrepancies: list[str] = []
     if omega_q and quartile.quartile and omega_q != quartile.quartile:
@@ -112,24 +143,30 @@ def merge_group(group: list[SourceRecord], *, quartiles: QuartileIndex, rules: R
         discrepancies.append("JOURNAL_NOT_IN_JCR")
     elif quartile.method == "title_fuzzy" or quartile.confidence in {"manual_review", "ambiguous"}:
         discrepancies.append("QUARTILE_AMBIGUOUS")
-    if wos_count is not None and scopus_count is not None and wos_count != scopus_count:
+    available_counts = [x for x in (wos_count, scopus_count, scival_count) if x is not None]
+    if len(set(available_counts)) > 1:
         discrepancies.append("INSTITUTION_COUNT_MISMATCH")
     if wos_records and not omega_records_:
         discrepancies.append("WOS_ONLY")
     if scopus_records and not omega_records_:
         discrepancies.append("SCOPUS_ONLY")
+
     years = {r.source: r.year for r in group if r.year is not None}
     if len(set(years.values())) > 1:
         discrepancies.append("YEAR_MISMATCH")
+
     muv_wos = next((r.muv_affiliation for r in wos_records if r.muv_affiliation is not None), None)
     muv_scopus = next((r.muv_affiliation for r in scopus_records if r.muv_affiliation is not None), None)
     if muv_wos is False or muv_scopus is False:
         discrepancies.append("AFFILIATION_MISMATCH")
+
     external_records = wos_records + scopus_records
     external_years = [r.year for r in external_records if r.year is not None]
     has_target_year = any(y == rules.assessment_year for y in external_years)
     affiliation_confirmed = (muv_wos is True) or (muv_scopus is True)
-    affiliation_definitively_false = bool(external_records) and not affiliation_confirmed and all(r.muv_affiliation is False for r in external_records if r.muv_affiliation is not None) and any(r.muv_affiliation is not None for r in external_records)
+    affiliation_definitively_false = bool(external_records) and not affiliation_confirmed and all(
+        r.muv_affiliation is False for r in external_records if r.muv_affiliation is not None
+    ) and any(r.muv_affiliation is not None for r in external_records)
     if external_records and affiliation_confirmed and has_target_year:
         eligible = True
         eligibility_reason = "External API evidence confirms MU-Varna affiliation and target year"
@@ -142,6 +179,7 @@ def merge_group(group: list[SourceRecord], *, quartiles: QuartileIndex, rules: R
     else:
         eligible = None
         eligibility_reason = "External API evidence is incomplete" if external_records else "OMEGA seed has not yet been independently verified"
+
     evidence_urls = sorted({r.evidence_url for r in group if r.evidence_url})
     status = "confirmed"
     if eligible is False:
@@ -150,7 +188,55 @@ def merge_group(group: list[SourceRecord], *, quartiles: QuartileIndex, rules: R
         status = "manual_review"
     elif discrepancies:
         status = "strongly_supported"
-    return CanonicalPublication(canonical_id=canonical_id_for(group),doi=_first(group, "doi"),wos_ut=_first(group, "wos_ut"),scopus_id=_first(group, "scopus_id"),scopus_eid=_first(group, "scopus_eid"),title=title,normalized_title=normalize_title(title),source_years=years,document_type=_first(group, "document_type"),source_title=source_title,issn=issn,eissn=eissn,in_omega=bool(omega_records_),in_wos=bool(wos_records),in_scopus=bool(scopus_records),eligible_for_calculation=eligible,eligibility_reason=eligibility_reason,muv_affiliation_wos=muv_wos,muv_affiliation_scopus=muv_scopus,omega_jif_quartile=omega_q,jif_quartile=quartile.quartile,quartile_match_method=quartile.method,quartile_match_confidence=quartile.confidence,wos_institution_count=wos_count,scopus_institution_count=scopus_count,scival_institution_count=scival_count,selected_institution_count=selected_count,institution_count_source=count_source,over_10_institutions=rules.is_over_threshold(selected_count),ministry_bucket=bucket,contribution_multiplier=multiplier,weighted_contribution=multiplier,score_contribution=score_contribution,discrepancy_codes=sorted(set(discrepancies)),verification_status=status,evidence_urls=evidence_urls,provenance=[{"source": r.source,"source_id": r.source_id,"year": r.year,"institution_count": r.institution_count,"evidence_url": r.evidence_url} for r in group])
+
+    return CanonicalPublication(
+        canonical_id=canonical_id_for(group),
+        doi=_first(group, "doi"),
+        wos_ut=_first(group, "wos_ut"),
+        scopus_id=_first(group, "scopus_id"),
+        scopus_eid=_first(group, "scopus_eid"),
+        title=title,
+        normalized_title=normalize_title(title),
+        source_years=years,
+        document_type=_first(group, "document_type"),
+        source_title=source_title,
+        issn=issn,
+        eissn=eissn,
+        in_omega=bool(omega_records_),
+        in_wos=bool(wos_records),
+        in_scopus=bool(scopus_records),
+        eligible_for_calculation=eligible,
+        eligibility_reason=eligibility_reason,
+        muv_affiliation_wos=muv_wos,
+        muv_affiliation_scopus=muv_scopus,
+        omega_jif_quartile=omega_q,
+        jif_quartile=quartile.quartile,
+        quartile_match_method=quartile.method,
+        quartile_match_confidence=quartile.confidence,
+        wos_institution_count=wos_count,
+        scopus_institution_count=scopus_count,
+        scival_institution_count=scival_count,
+        selected_institution_count=selected_count,
+        institution_count_source=count_source,
+        over_10_institutions=rules.is_over_threshold(selected_count),
+        ministry_bucket=bucket,
+        contribution_multiplier=multiplier,
+        weighted_contribution=multiplier,
+        score_contribution=score_contribution,
+        discrepancy_codes=sorted(set(discrepancies)),
+        verification_status=status,
+        evidence_urls=evidence_urls,
+        provenance=[
+            {
+                "source": r.source,
+                "source_id": r.source_id,
+                "year": r.year,
+                "institution_count": r.institution_count,
+                "evidence_url": r.evidence_url,
+            }
+            for r in group
+        ],
+    )
 
 
 def _flag_title_identifier_conflicts(publications: list[CanonicalPublication]) -> None:
@@ -184,7 +270,19 @@ def _path_list(value: str | Path | list[str | Path] | tuple[str | Path, ...] | N
     return list(value)
 
 
-def build_canonical_publications(*, omega_path: str | Path, quartiles_path: str | Path, rules_path: str | Path, wos_json: str | Path | list[str | Path] | tuple[str | Path, ...] | None = None, scopus_json: str | Path | list[str | Path] | tuple[str | Path, ...] | None = None, scival_csv: str | Path | None = None, scival_count_column: str | None = None, scival_doi_column: str | None = None, scival_wos_column: str | None = None, scival_scopus_column: str | None = None) -> list[CanonicalPublication]:
+def build_canonical_publications(
+    *,
+    omega_path: str | Path,
+    quartiles_path: str | Path,
+    rules_path: str | Path,
+    wos_json: str | Path | list[str | Path] | tuple[str | Path, ...] | None = None,
+    scopus_json: str | Path | list[str | Path] | tuple[str | Path, ...] | None = None,
+    scival_csv: str | Path | None = None,
+    scival_count_column: str | None = None,
+    scival_doi_column: str | None = None,
+    scival_wos_column: str | None = None,
+    scival_scopus_column: str | None = None,
+) -> list[CanonicalPublication]:
     rules = RuleEngine.from_yaml(rules_path)
     raw_records: list[SourceRecord] = omega_records(omega_path)
     rule_data = rules.rules
@@ -196,11 +294,17 @@ def build_canonical_publications(*, omega_path: str | Path, quartiles_path: str 
         raw_records.extend(source_records_from_wos_json(path, organization=wos_org))
     for path in scopus_paths:
         raw_records.extend(source_records_from_scopus_json(path, affiliation_id=scopus_aff))
+
     scival_lookup = None
     if scival_csv:
-        if not scival_count_column:
-            raise ValueError("--scival-count-column is required with a SciVal CSV")
-        scival_lookup = load_scival_counts(scival_csv,count_column=scival_count_column,doi_column=scival_doi_column,wos_column=scival_wos_column,scopus_column=scival_scopus_column)
+        scival_lookup = load_scival_counts(
+            scival_csv,
+            count_column=scival_count_column,
+            doi_column=scival_doi_column,
+            wos_column=scival_wos_column,
+            scopus_column=scival_scopus_column,
+        )
+
     quartile_index = QuartileIndex.from_csv(quartiles_path)
     groups = group_records(raw_records)
     publications = [merge_group(g, quartiles=quartile_index, rules=rules, scival_lookup=scival_lookup) for g in groups]
@@ -228,6 +332,7 @@ def aggregate(publications: Iterable[CanonicalPublication], rules: RuleEngine) -
     unresolved_weight = {bucket: 0 for bucket in buckets}
     over_10 = {bucket: 0 for bucket in buckets}
     excluded = 0
+
     for pub in pubs:
         bucket = pub.ministry_bucket or "a4"
         if pub.eligible_for_calculation is False:
@@ -243,14 +348,51 @@ def aggregate(publications: Iterable[CanonicalPublication], rules: RuleEngine) -
             weighted_known[bucket] += float(pub.weighted_contribution)
         if pub.over_10_institutions:
             over_10[bucket] += 1
+
     raw = {bucket: (None if unresolved_eligibility[bucket] else confirmed_raw[bucket]) for bucket in buckets}
-    weighted = {bucket: (None if unresolved_eligibility[bucket] or unresolved_weight[bucket] else round(weighted_known[bucket], 10)) for bucket in buckets}
+    weighted = {
+        bucket: (None if unresolved_eligibility[bucket] or unresolved_weight[bucket] else round(weighted_known[bucket], 10))
+        for bucket in buckets
+    }
     complete = all(v == 0 for v in unresolved_eligibility.values()) and all(v == 0 for v in unresolved_weight.values())
     score = rules.score({k: float(v) for k, v in weighted.items()}) if complete else None
-    return {"candidate_publication_count": len(pubs),"publication_count": (sum(confirmed_raw.values()) if all(v == 0 for v in unresolved_eligibility.values()) else None),"confirmed_publication_count": sum(confirmed_raw.values()),"excluded_publication_count": excluded,"unresolved_eligibility_count": sum(unresolved_eligibility.values()),"raw": raw,"raw_confirmed": confirmed_raw,"unresolved_eligibility_by_bucket": unresolved_eligibility,"weighted": weighted,"weighted_known": {k: round(v, 10) for k, v in weighted_known.items()},"unresolved_weight_count": unresolved_weight,"over_10": over_10,"a_score": score}
+    return {
+        "candidate_publication_count": len(pubs),
+        "publication_count": (sum(confirmed_raw.values()) if all(v == 0 for v in unresolved_eligibility.values()) else None),
+        "confirmed_publication_count": sum(confirmed_raw.values()),
+        "excluded_publication_count": excluded,
+        "unresolved_eligibility_count": sum(unresolved_eligibility.values()),
+        "raw": raw,
+        "raw_confirmed": confirmed_raw,
+        "unresolved_eligibility_by_bucket": unresolved_eligibility,
+        "weighted": weighted,
+        "weighted_known": {k: round(v, 10) for k, v in weighted_known.items()},
+        "unresolved_weight_count": unresolved_weight,
+        "over_10": over_10,
+        "a_score": score,
+    }
 
 
 def compare_to_ministry(publications: Iterable[CanonicalPublication], claim: MinistryClaim, rules: RuleEngine) -> list[dict[str, Any]]:
     calc = aggregate(publications, rules)
-    rows = [("publication_count", claim.publication_count, calc["publication_count"]),("q1_raw", claim.q1_raw, calc["raw"]["a1"]),("q1_weighted", claim.q1_weighted, calc["weighted"]["a1"]),("q2_raw", claim.q2_raw, calc["raw"]["a2"]),("q2_weighted", claim.q2_weighted, calc["weighted"]["a2"]),("q3_raw", claim.q3_raw, calc["raw"]["a3"]),("q3_weighted", claim.q3_weighted, calc["weighted"]["a3"]),("a4_raw", claim.a4_raw, calc["raw"]["a4"]),("a4_weighted", claim.a4_weighted, calc["weighted"]["a4"]),("a_score", claim.a_score, calc["a_score"])]
-    return [{"metric": name,"ministry_claim": ministry,"calculated": calculated,"difference": (calculated - ministry) if calculated is not None else None} for name, ministry, calculated in rows]
+    rows = [
+        ("publication_count", claim.publication_count, calc["publication_count"]),
+        ("q1_raw", claim.q1_raw, calc["raw"]["a1"]),
+        ("q1_weighted", claim.q1_weighted, calc["weighted"]["a1"]),
+        ("q2_raw", claim.q2_raw, calc["raw"]["a2"]),
+        ("q2_weighted", claim.q2_weighted, calc["weighted"]["a2"]),
+        ("q3_raw", claim.q3_raw, calc["raw"]["a3"]),
+        ("q3_weighted", claim.q3_weighted, calc["weighted"]["a3"]),
+        ("a4_raw", claim.a4_raw, calc["raw"]["a4"]),
+        ("a4_weighted", claim.a4_weighted, calc["weighted"]["a4"]),
+        ("a_score", claim.a_score, calc["a_score"]),
+    ]
+    return [
+        {
+            "metric": name,
+            "ministry_claim": ministry,
+            "calculated": calculated,
+            "difference": (calculated - ministry) if calculated is not None else None,
+        }
+        for name, ministry, calculated in rows
+    ]
