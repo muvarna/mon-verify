@@ -194,7 +194,6 @@ def _names_from_container(container: Any) -> list[Any]:
 
 
 def extract_wos_muv_authors(record: dict[str, Any], organization: str = "Medical University Varna") -> list[str]:
-    """Extract authors linked by WoS address numbers to the MU-Varna enhanced organization."""
     organization_key = normalize_title(organization)
     addresses = _get_path(record, "static_data", "fullrecord_metadata", "addresses", "address_name")
     muv_addr_numbers: set[str] = set()
@@ -209,15 +208,11 @@ def extract_wos_muv_authors(record: dict[str, Any], organization: str = "Medical
         address_spec = address.get("address_spec") if isinstance(address.get("address_spec"), dict) else {}
         muv_addr_numbers.update(_address_number_tokens(address.get("addr_no")))
         muv_addr_numbers.update(_address_number_tokens(address_spec.get("addr_no")))
-
-        # Some Expanded records list the associated authors directly under the address.
-        direct_names = _names_from_container(address) + _names_from_container(address_spec)
-        for item in direct_names:
+        for item in _names_from_container(address) + _names_from_container(address_spec):
             name = _author_name(item)
             if name:
                 found[name.casefold()] = name
 
-    # Most modern records associate summary authors and addresses using addr_no.
     summary_names = _get_path(record, "static_data", "summary", "names", "name")
     if muv_addr_numbers:
         for item in _as_list(summary_names):
@@ -229,7 +224,6 @@ def extract_wos_muv_authors(record: dict[str, Any], organization: str = "Medical
             name = _author_name(item)
             if name:
                 found[name.casefold()] = name
-
     return list(found.values())
 
 
@@ -278,6 +272,26 @@ def normalize_wos_record(record: dict[str, Any], organization: str = "Medical Un
     )
 
 
+def compact_wos_record(record: dict[str, Any], organization: str = "Medical University Varna") -> dict[str, Any] | None:
+    """Convert a large Expanded API record to the minimal auditable MON Verify schema."""
+    if is_research_commons_record(record):
+        return None
+    normalized = normalize_wos_record(record, organization=organization)
+    data = normalized.model_dump(exclude={"raw"})
+    data["_monverify_compact"] = True
+    return data
+
+
+def compact_wos_pages(pages: Iterable[dict[str, Any]], organization: str = "Medical University Varna") -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for page in pages:
+        for record in wos_records_from_payload(page):
+            item = compact_wos_record(record, organization=organization)
+            if item is not None:
+                compact.append(item)
+    return compact
+
+
 class WOSClient:
     def __init__(
         self,
@@ -298,15 +312,7 @@ class WOSClient:
     def headers(self) -> dict[str, str]:
         return {"X-ApiKey": self.api_key, "Accept": "application/json"}
 
-    def search_pages(
-        self,
-        query: str,
-        *,
-        database_id: str = "WOS",
-        count: int = 100,
-        use_cache: bool = True,
-        max_records: int | None = None,
-    ) -> list[dict[str, Any]]:
+    def search_pages(self, query: str, *, database_id: str = "WOS", count: int = 100, use_cache: bool = True, max_records: int | None = None) -> list[dict[str, Any]]:
         if count < 1 or count > 100:
             raise ValueError("WoS Expanded count must be between 1 and 100")
         pages: list[dict[str, Any]] = []
@@ -319,13 +325,7 @@ class WOSClient:
             page_count = count if max_records is None else min(count, max_records - retrieved)
             if page_count <= 0:
                 break
-            params = {
-                "databaseId": database_id,
-                "usrQuery": query,
-                "count": page_count,
-                "firstRecord": first_record,
-                "lang": "en",
-            }
+            params = {"databaseId": database_id, "usrQuery": query, "count": page_count, "firstRecord": first_record, "lang": "en"}
             cache_path = self.cache_dir / cache_key("search", params)
             if use_cache and cache_path.exists():
                 payload = read_json(cache_path)
@@ -345,19 +345,8 @@ class WOSClient:
                 break
         return pages
 
-    def get_by_ids(
-        self,
-        unique_ids: Iterable[str],
-        *,
-        database_id: str = "WOK",
-        batch_size: int = 100,
-        use_cache: bool = True,
-    ) -> list[dict[str, Any]]:
-        ids = [
-            str(x).strip()
-            for x in unique_ids
-            if str(x).strip() and not is_research_commons_uid(str(x).strip())
-        ]
+    def get_by_ids(self, unique_ids: Iterable[str], *, database_id: str = "WOK", batch_size: int = 100, use_cache: bool = True) -> list[dict[str, Any]]:
+        ids = [str(x).strip() for x in unique_ids if str(x).strip() and not is_research_commons_uid(str(x).strip())]
         pages: list[dict[str, Any]] = []
         for pos in range(0, len(ids), batch_size):
             batch = ids[pos : pos + batch_size]
@@ -376,9 +365,4 @@ class WOSClient:
 
     def search_records(self, query: str, **kwargs: Any) -> list[SourceRecord]:
         pages = self.search_pages(query, **kwargs)
-        return [
-            normalize_wos_record(record)
-            for page in pages
-            for record in wos_records_from_payload(page)
-            if not is_research_commons_record(record)
-        ]
+        return [normalize_wos_record(record) for page in pages for record in wos_records_from_payload(page) if not is_research_commons_record(record)]
