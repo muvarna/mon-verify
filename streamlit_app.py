@@ -10,14 +10,9 @@ import pandas as pd
 import streamlit as st
 
 from monverify.clients.common import APIRequestError
-from monverify.clients.scopus import ScopusClient, scopus_entries_from_payload
-from monverify.clients.wos import (
-    WOSClient,
-    is_research_commons_record,
-    is_research_commons_uid,
-    wos_records_from_payload,
-)
+from monverify.clients.wos import WOSClient, compact_wos_pages, is_research_commons_uid
 from monverify.ministry import parse_ministry_workbook
+from monverify.models import CanonicalPublication, MinistryClaim
 from monverify.omega import omega_records
 from monverify.reporting import publications_dataframe, united_verification_dataframe
 from monverify.rules import RuleEngine
@@ -26,11 +21,12 @@ from monverify.verification import aggregate, build_canonical_publications, comp
 
 st.set_page_config(page_title="MON Verify — MU-Varna", layout="wide")
 st.title("MON Verify — MU-Varna 2025")
-st.caption("Independent, publication-level verification of MON bibliometric claims.")
+st.caption("Home workflow: Web of Science Expanded + OMEGA + JCR/InCites quartiles + SciVal. Scopus API is not used.")
 
 RULES_PATH = Path("config/rules_2025.yaml")
 RULES = RuleEngine.from_yaml(RULES_PATH)
 WOS_DATABASE_ID = str(RULES.rules.get("wos", {}).get("database_id", "WOK"))
+WOS_ORG = str(RULES.rules.get("wos", {}).get("organization_enhanced", "Medical University Varna"))
 
 
 def _save_upload(upload, folder: Path, prefix: str = "") -> Path | None:
@@ -42,7 +38,7 @@ def _save_upload(upload, folder: Path, prefix: str = "") -> Path | None:
 
 
 def _save_uploads(uploads, folder: Path, prefix: str) -> list[Path]:
-    return [x for x in (_save_upload(upload, folder, f"{prefix}{i}_") for i, upload in enumerate(uploads or [], 1)) if x]
+    return [p for p in (_save_upload(u, folder, f"{prefix}{i}_") for i, u in enumerate(uploads or [], 1)) if p]
 
 
 def _secret(name: str) -> str:
@@ -52,61 +48,37 @@ def _secret(name: str) -> str:
         return os.getenv(name, "").strip()
 
 
-def _api_error_text(service: str, exc: APIRequestError) -> str:
-    status = exc.status_code
-    if service == "Scopus" and status == 401:
-        message = (
-            "Scopus returned HTTP 401 Unauthorized. The API key can still be valid locally if access depends "
-            "on the MU-Varna institutional IP range; Streamlit Cloud is outside that range."
-        )
-    elif service == "Scopus" and status == 403:
-        message = "Scopus returned HTTP 403. Check the API entitlement or institutional token."
-    elif status in {401, 403}:
-        message = f"{service} authentication/authorization failed (HTTP {status})."
-    elif status == 429:
-        message = f"{service} rate limit reached (HTTP 429)."
-    elif status:
-        message = f"{service} API returned HTTP {status}."
-    else:
-        message = f"{service} API request failed."
-    if exc.detail:
-        message += f" Server message: {exc.detail}"
-    return message
-
-
-def _show_api_failure(service: str, exc: Exception) -> None:
+def _api_error_text(exc: Exception) -> str:
     if isinstance(exc, APIRequestError):
-        st.error(_api_error_text(service, exc))
-        if service == "Scopus" and exc.status_code in {401, 403}:
-            st.info(
-                "Use the SciVal CSV as the institution-count fallback and/or retrieve Scopus JSON locally. "
-                "A Scopus Insttoken can also be configured later if Elsevier provides one."
-            )
-    else:
-        st.error(f"{service} retrieval failed: {exc}")
+        if exc.status_code in {401, 403}:
+            return f"WoS authentication/authorization failed (HTTP {exc.status_code}). {exc.detail or ''}".strip()
+        if exc.status_code == 429:
+            return "WoS rate limit reached (HTTP 429). Retry later or use cached/uploaded JSON."
+        return f"WoS API request failed{f' (HTTP {exc.status_code})' if exc.status_code else ''}. {exc.detail or ''}".strip()
+    return f"WoS retrieval failed: {exc}"
 
 
 with st.sidebar:
-    st.header("Mode")
-    mode = st.radio("Data source", ["Uploaded/cached data", "Live APIs"])
-    st.markdown("**Institution identifiers**")
-    st.code(f"WoS: Medical University Varna\nWoS database: {WOS_DATABASE_ID}\nScopus AF-ID: 60005828")
-    st.caption("WoS Research Commons (RC prefix) is excluded. Institution-count priority: WoS → Scopus → SciVal")
+    st.header("Workflow")
+    mode = st.radio("WoS evidence source", ["Uploaded/cached JSON", "Live WoS API"])
+    st.code(f"WoS organization: {WOS_ORG}\nWoS database: {WOS_DATABASE_ID}")
+    st.caption("Research Commons records with RC prefix are excluded. Institution-count priority: WoS → SciVal.")
 
-st.subheader("Input files")
+st.subheader("Required inputs")
 col1, col2, col3 = st.columns(3)
 with col1:
-    ministry_upload = st.file_uploader("Ministry XLSX", type=["xlsx"])
-with col2:
     omega_upload = st.file_uploader("OMEGA CSV", type=["csv"])
-with col3:
+with col2:
     quartile_upload = st.file_uploader("2025 JCR/InCites quartiles CSV", type=["csv"])
+with col3:
+    scival_upload = st.file_uploader("SciVal CSV", type=["csv"], help="Header-first CSV containing EID, DOI, Title, Year, Number of Institutions.")
 
-scival_upload = st.file_uploader(
-    "Optional SciVal publication export (institution-count fallback)",
-    type=["csv"],
-    help="The standard SciVal export is auto-detected. SciVal supplies institution counts only; it does not by itself prove Ministry eligibility.",
+ministry_upload = st.file_uploader(
+    "Optional Ministry XLSX",
+    type=["xlsx"],
+    help="If omitted, the versioned 2025 MON claim from config/rules_2025.yaml is used.",
 )
+
 if scival_upload is not None:
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,190 +86,105 @@ if scival_upload is not None:
             p.write_bytes(scival_upload.getvalue())
             info = inspect_scival(p)
         st.success(
-            f"SciVal loaded: {info['rows']} publications · {info['over_10_institutions']} with >10 institutions · "
-            f"maximum {info['max_institutions']} institutions."
+            f"SciVal: {info['rows']} rows · {info['over_10_institutions']} records with >10 institutions · max {info['max_institutions']}."
         )
     except Exception as exc:
         st.error(f"SciVal file could not be read: {exc}")
 
 wos_uploads: list = []
-scopus_uploads: list = []
-
-if mode == "Uploaded/cached data":
-    col4, col5 = st.columns(2)
-    with col4:
-        wos_uploads = st.file_uploader(
-            "Optional WoS JSON files",
-            type=["json"],
-            accept_multiple_files=True,
-            help="Upload discovery and/or OMEGA-ID verification JSON files. RC-prefix Research Commons records are ignored during verification.",
-        )
-    with col5:
-        scopus_uploads = st.file_uploader(
-            "Optional Scopus JSON files",
-            type=["json"],
-            accept_multiple_files=True,
-            help="Upload locally retrieved Scopus JSON when Streamlit Cloud cannot authenticate.",
-        )
+if mode == "Uploaded/cached JSON":
+    wos_uploads = st.file_uploader(
+        "WoS compact/raw JSON files",
+        type=["json"],
+        accept_multiple_files=True,
+        help="Upload discovery and/or OMEGA-ID verification JSON. New fetches use compact MON Verify JSON.",
+    )
 else:
-    st.subheader("Live API retrieval")
+    st.subheader("Live Web of Science retrieval")
     workflows = st.multiselect(
         "Retrieval workflows",
         ["Independent institutional discovery", "Verify OMEGA identifiers"],
         default=["Independent institutional discovery", "Verify OMEGA identifiers"],
     )
     wos_key = st.text_input("WoS Expanded API key", value=_secret("WOS_API_KEY"), type="password").strip()
-    scopus_key = st.text_input("Scopus API key", value=_secret("SCOPUS_API_KEY"), type="password").strip()
-    scopus_insttoken = st.text_input(
-        "Optional Scopus institution token", value=_secret("SCOPUS_INSTTOKEN"), type="password"
-    ).strip()
     year = st.number_input("Year", min_value=2000, max_value=2100, value=2025, step=1)
-    st.caption(
-        f"Configured credentials — WoS: {'yes' if wos_key else 'no'} · Scopus: {'yes' if scopus_key else 'no'} · "
-        f"Scopus Insttoken: {'yes' if scopus_insttoken else 'no'}"
-    )
 
-    if st.button("Fetch API evidence", type="primary"):
-        if not wos_key and not scopus_key:
-            st.error("Enter at least one API key.")
+    if st.button("Fetch WoS evidence", type="primary"):
+        if not wos_key:
+            st.error("Enter WOS_API_KEY.")
         elif "Verify OMEGA identifiers" in workflows and omega_upload is None:
-            st.error("OMEGA CSV is required for OMEGA-identifier verification.")
+            st.error("OMEGA CSV is required to verify OMEGA WoS identifiers.")
         else:
-            st.session_state["wos_live_files"] = []
-            st.session_state["scopus_live_files"] = []
-            st.session_state["api_errors"] = []
-            omega_source_records = []
-            if "Verify OMEGA identifiers" in workflows and omega_upload is not None:
-                with tempfile.TemporaryDirectory() as tmp:
-                    omega_path = Path(tmp) / omega_upload.name
-                    omega_path.write_bytes(omega_upload.getvalue())
-                    omega_source_records = omega_records(omega_path)
+            st.session_state["wos_live_payloads"] = []
+            try:
+                client = WOSClient(wos_key)
+                if "Independent institutional discovery" in workflows:
+                    query = f'OG=("{WOS_ORG}") AND PY={int(year)}'
+                    with st.spinner("WoS institutional discovery..."):
+                        pages = client.search_pages(query, database_id=WOS_DATABASE_ID)
+                    records = compact_wos_pages(pages, organization=WOS_ORG)
+                    st.session_state["wos_live_payloads"].append({
+                        "format": "monverify-wos-compact-v1",
+                        "mode": "institution_discovery",
+                        "query": query,
+                        "database_id": WOS_DATABASE_ID,
+                        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                        "records": records,
+                    })
+                    st.success(f"WoS discovery: {len(records)} compact non-RC records.")
 
-            if wos_key:
-                try:
-                    client = WOSClient(wos_key)
-                    if "Independent institutional discovery" in workflows:
-                        with st.spinner("WoS: independent institutional discovery..."):
-                            query = f'OG=("Medical University Varna") AND PY={int(year)}'
-                            pages = client.search_pages(query, database_id=WOS_DATABASE_ID)
-                            st.session_state["wos_live_files"].append(
-                                {
-                                    "mode": "institution_discovery",
-                                    "query": query,
-                                    "database_id": WOS_DATABASE_ID,
-                                    "retrieved_at": datetime.now(timezone.utc).isoformat(),
-                                    "pages": pages,
-                                }
-                            )
-                            raw_records = [record for page in pages for record in wos_records_from_payload(page)]
-                            rc_count = sum(1 for record in raw_records if is_research_commons_record(record))
-                            usable_count = len(raw_records) - rc_count
-                            st.success(
-                                f"WoS discovery: {usable_count} usable record(s); {rc_count} Research Commons record(s) excluded."
-                            )
-                    if "Verify OMEGA identifiers" in workflows:
-                        with st.spinner("WoS: verifying OMEGA identifiers..."):
-                            ids = sorted(
-                                {
-                                    r.wos_ut
-                                    for r in omega_source_records
-                                    if r.wos_ut and not is_research_commons_uid(r.wos_ut)
-                                }
-                            )
-                            pages = client.get_by_ids(ids, database_id=WOS_DATABASE_ID)
-                            st.session_state["wos_live_files"].append(
-                                {
-                                    "mode": "omega_ids",
-                                    "database_id": WOS_DATABASE_ID,
-                                    "requested_ids": ids,
-                                    "retrieved_at": datetime.now(timezone.utc).isoformat(),
-                                    "pages": pages,
-                                }
-                            )
-                            st.success(f"WoS OMEGA-ID verification requested {len(ids)} non-RC identifier(s).")
-                except Exception as exc:
-                    st.session_state["api_errors"].append({"service": "WoS", "error": str(exc)})
-                    _show_api_failure("WoS", exc)
+                if "Verify OMEGA identifiers" in workflows:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        omega_path = Path(tmp) / omega_upload.name
+                        omega_path.write_bytes(omega_upload.getvalue())
+                        ids = sorted({r.wos_ut for r in omega_records(omega_path) if r.wos_ut and not is_research_commons_uid(r.wos_ut)})
+                    with st.spinner("WoS OMEGA-ID verification..."):
+                        pages = client.get_by_ids(ids, database_id=WOS_DATABASE_ID)
+                    records = compact_wos_pages(pages, organization=WOS_ORG)
+                    st.session_state["wos_live_payloads"].append({
+                        "format": "monverify-wos-compact-v1",
+                        "mode": "omega_ids",
+                        "database_id": WOS_DATABASE_ID,
+                        "requested_ids": ids,
+                        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                        "records": records,
+                    })
+                    st.success(f"OMEGA-ID verification: {len(records)} compact records returned from {len(ids)} requested non-RC IDs.")
+            except Exception as exc:
+                st.error(_api_error_text(exc))
 
-            if scopus_key:
-                try:
-                    client = ScopusClient(scopus_key, insttoken=scopus_insttoken or None)
-                    if "Independent institutional discovery" in workflows:
-                        with st.spinner("Scopus: independent institutional discovery..."):
-                            query = f"AF-ID(60005828) AND PUBYEAR = {int(year)}"
-                            pages = client.search_pages(query)
-                            st.session_state["scopus_live_files"].append(
-                                {
-                                    "mode": "institution_discovery",
-                                    "query": query,
-                                    "retrieved_at": datetime.now(timezone.utc).isoformat(),
-                                    "pages": pages,
-                                }
-                            )
-                            st.success(f"Scopus discovery: {sum(len(scopus_entries_from_payload(p)) for p in pages)} record(s).")
-                    if "Verify OMEGA identifiers" in workflows:
-                        with st.spinner("Scopus: verifying OMEGA identifiers..."):
-                            ids = sorted({r.scopus_id for r in omega_source_records if r.scopus_id})
-                            abstracts = client.retrieve_many(ids)
-                            st.session_state["scopus_live_files"].append(
-                                {
-                                    "mode": "omega_ids",
-                                    "requested_ids": ids,
-                                    "retrieved_at": datetime.now(timezone.utc).isoformat(),
-                                    "abstracts": abstracts,
-                                }
-                            )
-                            failures = sum(1 for x in abstracts if x.get("_monverify_error"))
-                            st.success(f"Scopus OMEGA-ID verification requested {len(ids)} identifier(s); failures: {failures}.")
-                except Exception as exc:
-                    st.session_state["api_errors"].append({"service": "Scopus", "error": str(exc)})
-                    _show_api_failure("Scopus", exc)
-
-            available = len(st.session_state.get("wos_live_files", [])) + len(st.session_state.get("scopus_live_files", []))
-            if available:
-                st.success(f"API retrieval completed with {available} evidence set(s). You can run verification now.")
-            elif st.session_state.get("api_errors"):
-                st.warning("No live API evidence was retrieved. Uploaded/cached mode remains available.")
-
-if st.button("Run verification", disabled=not (ministry_upload and omega_upload and quartile_upload)):
+required = omega_upload is not None and quartile_upload is not None and scival_upload is not None
+if st.button("Run verification", disabled=not required):
     with tempfile.TemporaryDirectory() as tmp:
         folder = Path(tmp)
-        ministry_path = _save_upload(ministry_upload, folder)
         omega_path = _save_upload(omega_upload, folder)
         quartile_path = _save_upload(quartile_upload, folder)
-        scival_path = _save_upload(scival_upload, folder, "scival_") if scival_upload else None
-        wos_paths: list[Path] = []
-        scopus_paths: list[Path] = []
-        if mode == "Uploaded/cached data":
-            wos_paths = _save_uploads(wos_uploads, folder, "wos_")
-            scopus_paths = _save_uploads(scopus_uploads, folder, "scopus_")
-        else:
-            for i, payload in enumerate(st.session_state.get("wos_live_files", []), start=1):
-                path = folder / f"wos_live_{i}.json"
-                path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-                wos_paths.append(path)
-            for i, payload in enumerate(st.session_state.get("scopus_live_files", []), start=1):
-                path = folder / f"scopus_live_{i}.json"
-                path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-                scopus_paths.append(path)
+        scival_path = _save_upload(scival_upload, folder, "scival_")
+        ministry_path = _save_upload(ministry_upload, folder, "ministry_") if ministry_upload else None
 
-        claim = parse_ministry_workbook(ministry_path)
+        wos_paths: list[Path] = []
+        if mode == "Uploaded/cached JSON":
+            wos_paths = _save_uploads(wos_uploads, folder, "wos_")
+        else:
+            for i, payload in enumerate(st.session_state.get("wos_live_payloads", []), 1):
+                p = folder / f"wos_live_{i}.json"
+                p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                wos_paths.append(p)
+
+        claim = parse_ministry_workbook(ministry_path) if ministry_path else RULES.ministry_claim()
         pubs = build_canonical_publications(
             omega_path=omega_path,
             quartiles_path=quartile_path,
             rules_path=RULES_PATH,
             wos_json=wos_paths,
-            scopus_json=scopus_paths,
             scival_csv=scival_path,
         )
         st.session_state["claim"] = claim.model_dump()
         st.session_state["pubs"] = [p.model_dump() for p in pubs]
-        st.session_state["comparison"] = compare_to_ministry(pubs, claim, RULES)
         st.session_state["aggregate"] = aggregate(pubs, RULES)
+        st.session_state["comparison"] = compare_to_ministry(pubs, claim, RULES)
 
 if "pubs" in st.session_state:
-    from monverify.models import CanonicalPublication, MinistryClaim
-
     pubs = [CanonicalPublication(**x) for x in st.session_state["pubs"]]
     claim = MinistryClaim(**st.session_state["claim"])
     agg = st.session_state["aggregate"]
@@ -307,28 +194,27 @@ if "pubs" in st.session_state:
 
     st.subheader("MON vs calculated")
     c1, c2, c3, c4 = st.columns(4)
-    pub_count = agg["publication_count"]
-    c1.metric(
-        "Publications",
-        pub_count if pub_count is not None else "unresolved",
-        (pub_count - claim.publication_count if pub_count is not None else None),
-    )
-    q1w, q2w, score = agg["weighted"]["a1"], agg["weighted"]["a2"], agg["a_score"]
-    c2.metric("Q1 weighted", q1w if q1w is not None else "unresolved", (round(q1w - claim.q1_weighted, 3) if q1w is not None else None))
-    c3.metric("Q2 weighted", q2w if q2w is not None else "unresolved", (round(q2w - claim.q2_weighted, 3) if q2w is not None else None))
-    c4.metric("a score", score if score is not None else "unresolved", (round(score - claim.a_score, 3) if score is not None else None))
+    c1.metric("Confirmed publications", agg["publication_count"], agg["publication_count"] - claim.publication_count)
+    c2.metric("Q1 weighted", agg["weighted"]["a1"], round(agg["weighted"]["a1"] - claim.q1_weighted, 3))
+    c3.metric("Q2 weighted", agg["weighted"]["a2"], round(agg["weighted"]["a2"] - claim.q2_weighted, 3))
+    c4.metric("a score", agg["a_score"], round(agg["a_score"] - claim.a_score, 3))
 
-    source_counts = frame["institution_count_source"].fillna("unresolved").value_counts().to_dict() if not frame.empty else {}
+    if not agg["calculation_complete"]:
+        st.warning(
+            f"Confirmed subtotal shown. {agg['unresolved_eligibility_count']} records still have unresolved eligibility; "
+            f"unresolved weight counts: {agg['unresolved_weight_count']}."
+        )
+    else:
+        st.success("Calculation is complete: no unresolved eligibility or institution-weight records remain.")
+
     st.caption(
         f"Candidates: {agg['candidate_publication_count']} · confirmed eligible: {agg['confirmed_publication_count']} · "
-        f"excluded: {agg['excluded_publication_count']} · unresolved eligibility: {agg['unresolved_eligibility_count']} · "
-        f"count sources: {source_counts}"
+        f"excluded: {agg['excluded_publication_count']} · unresolved: {agg['unresolved_eligibility_count']}"
     )
     st.dataframe(comparison, use_container_width=True, hide_index=True)
 
     tabs = st.tabs(["United table", "Canonical", "Discrepancies", ">10 institutions", "Unresolved", "Downloads"])
     with tabs[0]:
-        st.caption("OMEGA-shaped output ordered Confirmed → Unresolved → Excluded.")
         st.dataframe(united, use_container_width=True, hide_index=True)
     with tabs[1]:
         st.dataframe(frame, use_container_width=True, hide_index=True)
@@ -339,15 +225,10 @@ if "pubs" in st.session_state:
         over_10 = frame[frame["over_10_institutions"] == True]  # noqa: E712
         st.dataframe(over_10, use_container_width=True, hide_index=True)
     with tabs[4]:
-        unresolved = frame[frame["verification_status"] == "manual_review"]
+        unresolved = frame[frame["verification_status"].isin(["manual_review", "ambiguous"])]
         st.dataframe(unresolved, use_container_width=True, hide_index=True)
     with tabs[5]:
-        st.download_button(
-            "united_verification_table.csv",
-            united.to_csv(index=False).encode("utf-8-sig"),
-            "united_verification_table.csv",
-            "text/csv",
-        )
+        st.download_button("united_verification_table.csv", united.to_csv(index=False).encode("utf-8-sig"), "united_verification_table.csv", "text/csv")
         st.download_button("canonical_publications.csv", frame.to_csv(index=False).encode("utf-8-sig"), "canonical_publications.csv", "text/csv")
         st.download_button("ministry_comparison.csv", comparison.to_csv(index=False).encode("utf-8-sig"), "ministry_comparison.csv", "text/csv")
         st.download_button("ministry_corrections.csv", discrepancies.to_csv(index=False).encode("utf-8-sig"), "ministry_corrections.csv", "text/csv")
@@ -356,4 +237,4 @@ if "pubs" in st.session_state:
         summary = {"ministry_claim": claim.model_dump(), "calculated": agg}
         st.download_button("verification_summary.json", json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8"), "verification_summary.json", "application/json")
 else:
-    st.info("Upload the three required files, optionally add SciVal/API evidence, then run verification.")
+    st.info("Upload OMEGA, quartiles and SciVal; add WoS evidence by upload or live API; then run verification.")

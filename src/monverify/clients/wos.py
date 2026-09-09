@@ -30,7 +30,7 @@ def _get_path(obj: Any, *keys: str) -> Any:
 
 
 def _uid(record: dict[str, Any]) -> str | None:
-    value = str(record.get("UID") or record.get("uid") or "").strip()
+    value = str(record.get("UID") or record.get("uid") or record.get("wos_ut") or "").strip()
     return value or None
 
 
@@ -76,9 +76,7 @@ def _records_found(payload: dict[str, Any]) -> int | None:
 def _title_of_type(record: dict[str, Any], wanted: str) -> str | None:
     titles = _get_path(record, "static_data", "summary", "titles", "title")
     for item in _as_list(titles):
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("type", "")).lower() == wanted.lower():
+        if isinstance(item, dict) and str(item.get("type", "")).lower() == wanted.lower():
             value = item.get("content") or item.get("value")
             if value:
                 return str(value)
@@ -90,8 +88,7 @@ def _find_identifier(record: dict[str, Any], types: set[str]) -> str | None:
 
     def walk(value: Any) -> str | None:
         if isinstance(value, dict):
-            type_value = str(value.get("type", "")).lower()
-            if type_value in wanted:
+            if str(value.get("type", "")).lower() in wanted:
                 candidate = value.get("value") or value.get("content") or value.get("id")
                 if candidate:
                     return str(candidate)
@@ -111,14 +108,14 @@ def _find_identifier(record: dict[str, Any], types: set[str]) -> str | None:
 
 def _preferred_organizations(address: dict[str, Any]) -> list[str]:
     organizations = _get_path(address, "address_spec", "organizations", "organization")
-    found: list[str] = []
+    result: list[str] = []
     for org in _as_list(organizations):
         if not isinstance(org, dict) or str(org.get("pref", "")).upper() != "Y":
             continue
         name = org.get("content") or org.get("value")
         if name:
-            found.append(str(name).strip())
-    return found
+            result.append(str(name).strip())
+    return result
 
 
 def extract_wos_enhanced_institutions(record: dict[str, Any]) -> list[str]:
@@ -155,10 +152,7 @@ def _address_number_tokens(value: Any) -> set[str]:
     if not text:
         return tokens
     numbers = re.findall(r"\d+", text)
-    if numbers:
-        tokens.update(numbers)
-    else:
-        tokens.add(text)
+    tokens.update(numbers if numbers else [text])
     return tokens
 
 
@@ -168,7 +162,7 @@ def _author_name(item: Any) -> str | None:
     if not isinstance(item, dict):
         return None
     role = str(item.get("role") or "").strip().lower()
-    if role and role not in {"author"}:
+    if role and role != "author":
         return None
     for key in ("display_name", "full_name", "wos_standard", "content", "value"):
         value = item.get(key)
@@ -189,12 +183,10 @@ def _names_from_container(container: Any) -> list[Any]:
         return _as_list(names.get("name"))
     if isinstance(names, list):
         return names
-    name = container.get("name")
-    return _as_list(name) if name is not None else []
+    return _as_list(container.get("name")) if container.get("name") is not None else []
 
 
 def extract_wos_muv_authors(record: dict[str, Any], organization: str = "Medical University Varna") -> list[str]:
-    """Extract authors linked by WoS address numbers to the MU-Varna enhanced organization."""
     organization_key = normalize_title(organization)
     addresses = _get_path(record, "static_data", "fullrecord_metadata", "addresses", "address_name")
     muv_addr_numbers: set[str] = set()
@@ -206,34 +198,33 @@ def extract_wos_muv_authors(record: dict[str, Any], organization: str = "Medical
         preferred = _preferred_organizations(address)
         if not any(normalize_title(name) == organization_key for name in preferred):
             continue
-        address_spec = address.get("address_spec") if isinstance(address.get("address_spec"), dict) else {}
+        spec = address.get("address_spec") if isinstance(address.get("address_spec"), dict) else {}
         muv_addr_numbers.update(_address_number_tokens(address.get("addr_no")))
-        muv_addr_numbers.update(_address_number_tokens(address_spec.get("addr_no")))
-
-        # Some Expanded records list the associated authors directly under the address.
-        direct_names = _names_from_container(address) + _names_from_container(address_spec)
-        for item in direct_names:
+        muv_addr_numbers.update(_address_number_tokens(spec.get("addr_no")))
+        for item in _names_from_container(address) + _names_from_container(spec):
             name = _author_name(item)
             if name:
                 found[name.casefold()] = name
 
-    # Most modern records associate summary authors and addresses using addr_no.
     summary_names = _get_path(record, "static_data", "summary", "names", "name")
     if muv_addr_numbers:
         for item in _as_list(summary_names):
             if not isinstance(item, dict):
                 continue
-            author_addr_numbers = _address_number_tokens(item.get("addr_no"))
-            if not author_addr_numbers.intersection(muv_addr_numbers):
+            if not _address_number_tokens(item.get("addr_no")).intersection(muv_addr_numbers):
                 continue
             name = _author_name(item)
             if name:
                 found[name.casefold()] = name
-
     return list(found.values())
 
 
 def normalize_wos_record(record: dict[str, Any], organization: str = "Medical University Varna") -> SourceRecord:
+    if record.get("_monverify_compact"):
+        data = {k: v for k, v in record.items() if k != "_monverify_compact"}
+        data["raw"] = None
+        return SourceRecord(**data)
+
     uid = _uid(record)
     title = _title_of_type(record, "item")
     source_title = _title_of_type(record, "source")
@@ -252,11 +243,10 @@ def normalize_wos_record(record: dict[str, Any], organization: str = "Medical Un
     doi = normalize_doi(_find_identifier(record, {"doi"}))
     issn = normalize_issn(_find_identifier(record, {"issn"}))
     eissn = normalize_issn(_find_identifier(record, {"eissn", "e-issn"}))
+    evidence_url = None
     if uid:
         collection = "woscc" if uid.upper().startswith("WOS:") else "alldb"
         evidence_url = f"https://www.webofscience.com/wos/{collection}/full-record/{uid}"
-    else:
-        evidence_url = None
     return SourceRecord(
         source="wos",
         source_id=uid or f"wos:{normalize_title(title) or 'unknown'}",
@@ -276,6 +266,25 @@ def normalize_wos_record(record: dict[str, Any], organization: str = "Medical Un
         evidence_url=evidence_url,
         raw=record,
     )
+
+
+def compact_wos_record(record: dict[str, Any], organization: str = "Medical University Varna") -> dict[str, Any] | None:
+    if is_research_commons_record(record):
+        return None
+    normalized = normalize_wos_record(record, organization=organization)
+    data = normalized.model_dump(exclude={"raw"})
+    data["_monverify_compact"] = True
+    return data
+
+
+def compact_wos_pages(pages: Iterable[dict[str, Any]], organization: str = "Medical University Varna") -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for page in pages:
+        for record in wos_records_from_payload(page):
+            compact = compact_wos_record(record, organization=organization)
+            if compact is not None:
+                result.append(compact)
+    return result
 
 
 class WOSClient:
@@ -353,11 +362,7 @@ class WOSClient:
         batch_size: int = 100,
         use_cache: bool = True,
     ) -> list[dict[str, Any]]:
-        ids = [
-            str(x).strip()
-            for x in unique_ids
-            if str(x).strip() and not is_research_commons_uid(str(x).strip())
-        ]
+        ids = [str(x).strip() for x in unique_ids if str(x).strip() and not is_research_commons_uid(str(x).strip())]
         pages: list[dict[str, Any]] = []
         for pos in range(0, len(ids), batch_size):
             batch = ids[pos : pos + batch_size]

@@ -1,306 +1,274 @@
 # MON Verify — MU-Varna 2025
 
-Auditable Python tooling for independently verifying the 2025 publication indicator supplied by the Bulgarian Ministry of Education and Science (MON) for Medical University – Varna.
+Auditable verification tooling for the 2025 MU-Varna publication indicator supplied by the Bulgarian Ministry of Education and Science (MON).
 
-The Ministry workbook is treated as a **claim**, not as source truth. The verification corpus is built from OMEGA PSIR, Web of Science Expanded, Scopus, and the supplied 2025 JCR/InCites journal-quartile export.
+This branch/workflow is intentionally designed for use **outside the MU-Varna network**:
 
-## 2025 Ministry claim
+- Web of Science Expanded API is the only live bibliographic API;
+- Scopus API is not used;
+- SciVal CSV provides institution counts when WoS does not;
+- OMEGA is the local seed/reconciliation source;
+- the supplied 2025 JCR/InCites CSV supplies the best JIF quartile per journal;
+- the Ministry workbook is optional because the known 2025 claim is versioned in `config/rules_2025.yaml`.
 
-The supplied assessment workbook reports:
-
-- publications: 334
-- Q1 raw: 116; adjusted: 103.4
-- Q2 raw: 93; adjusted: 92.1
-- Q3: 50
-- a4: 75
-- final publication score: 968.3
-
-Rule implemented in `config/rules_2025.yaml`:
+## 2025 rule
 
 ```text
 a = 5*a1 + 3*a2 + 2*a3 + a4
 ```
 
-A publication with co-authors from **more than 10 institutions** contributes `0.1`; otherwise it contributes `1.0`. The rule counts institutions, not authors.
+If a publication has co-authors from **more than 10 institutions**, contribution is `0.1`; otherwise `1.0`. Institution-count priority is:
 
-Institution configuration:
+1. Web of Science Organization-Enhanced institutions;
+2. SciVal `Number of Institutions`.
 
-- Web of Science Organization-Enhanced: `Medical University Varna`
-- Scopus Affiliation ID: `60005828`
+WoS Research Commons records whose UID starts with `RC` are excluded.
 
-All document/publication types are included unless later Ministry evidence establishes an exclusion.
+## Versioned Ministry claim
 
-## Evidence priority
+`config/rules_2025.yaml` contains the comparison claim:
 
-### Quartiles
+- publications: 334
+- Q1 raw: 116
+- Q1 adjusted: 103.4
+- Q2 raw: 93
+- Q2 adjusted: 92.1
+- Q3: 50
+- a4: 75
+- final score: 968.3
 
-Use the supplied 2025 JCR/InCites export. It already contains the best quartile per journal.
+The claim is never used to force the calculated result.
 
-Journal matching priority:
+## Input CSV formats
 
-1. ISSN
-2. eISSN
-3. exact normalized journal title
-4. fuzzy title only as a manual-review suggestion
+### OMEGA
 
-The OMEGA `JIFQuartile` field is preserved for comparison but does not override the supplied JCR/InCites file.
-
-### Institution count
-
-Priority:
-
-1. WoS Expanded enhanced organizations
-2. Scopus affiliation metadata when WoS count is missing
-3. optional SciVal CSV supplied by the user
-
-If WoS and Scopus counts disagree, both are retained and `INSTITUTION_COUNT_MISMATCH` is reported. WoS remains the selected source because it has priority.
-
-## Repository layout
+Expected headers include:
 
 ```text
-mon-verify/
-├── config/rules_2025.yaml
-├── src/monverify/
-│   ├── cli.py
-│   ├── config.py
-│   ├── models.py
-│   ├── normalization.py
-│   ├── ministry.py
-│   ├── omega.py
-│   ├── incites.py
-│   ├── dedup.py
-│   ├── scival.py
-│   ├── rules.py
-│   ├── verification.py
-│   ├── reporting.py
-│   └── clients/
-│       ├── common.py
-│       ├── wos.py
-│       └── scopus.py
-├── streamlit_app.py
-├── tests/
-└── .github/workflows/tests.yml
+Reference,Journal,publicationType,Issue year,DOI,WoSId,ScopusId,JIFQuartile,Authors MU-Varna,Link WOS,Link Scopus
 ```
 
-## Installation
+Leading/trailing whitespace in OMEGA header names is stripped automatically.
 
-Python 3.11+ is recommended.
+### JCR/InCites quartiles
+
+Expected headers:
+
+```text
+Name,ISSN,eISSN,Journal Impact Factor,JIF Quartile
+```
+
+Matching priority is ISSN, eISSN, normalized journal title. Fuzzy title matches are flagged for review.
+
+### SciVal
+
+For the home workflow, export/prepare the CSV so it starts directly with this header row; remove the first metadata rows and final copyright line before running:
+
+```text
+Title,Authors,Year,Scopus Source title,ISSN,Language,Citations,DOI,Publication type,EID,Number of Institutions
+```
+
+Required for institution matching are `Number of Institutions` plus one or more of `EID`, `DOI`, or `Title` + `Year`.
+
+## Ubuntu installation
 
 ```bash
-python -m venv .venv
-```
+git clone https://github.com/muvarna/mon-verify.git
+cd mon-verify
 
-Windows PowerShell:
-
-```powershell
-.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
-```
-
-Linux/macOS:
-
-```bash
+python3 --version
+python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -e ".[dev]"
 ```
 
-## API configuration
+Python 3.11 or newer is required.
 
-Copy `.env.example` to `.env`:
+Create `.env`:
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Set:
 
 ```text
-WOS_API_KEY=...
-SCOPUS_API_KEY=...
-SCOPUS_INSTTOKEN=
+WOS_API_KEY=YOUR_WOS_EXPANDED_API_KEY
 ```
 
-Never commit `.env` or `.streamlit/secrets.toml`.
+Never commit `.env`.
 
-The WoS client sends the API key in `X-ApiKey` and paginates with `firstRecord`/`count`. The 2025 rules default to `databaseId=WOK` because the Ministry workbook explicitly says Web of Science **all databases**; `--database-id` can override this for controlled tests.
-
-The Scopus client sends `X-ELS-APIKey`, optionally `X-ELS-Insttoken`, and uses cursor pagination when the API provides a cursor.
-
-Both clients implement JSON page caching, retries for HTTP 429/5xx responses, and exponential backoff.
-
-## Inspect the source files
-
-```bash
-monverify inspect-ministry "assess-MUV-2025(1).xlsx"
-monverify inspect-omega "OMEGA_2025.xlsm - Worksheet (1).csv"
-monverify inspect-quartiles journals_Q_wos_2025.csv
-```
-
-OMEGA IDs are read as strings so long Scopus identifiers are not converted to floating-point/scientific notation.
-
-## API retrieval workflows
-
-The CLI supports both required workflows. Keep the outputs separate and pass both to `verify`; the canonicalizer merges them with OMEGA.
-
-### 1. Independent discovery — WoS Expanded
-
-```bash
-monverify fetch-wos --year 2025 --organization "Medical University Varna" --database-id WOK \
-  --output data/raw/wos_2025.json
-```
-
-Default query:
+## Recommended local file layout
 
 ```text
-OG=("Medical University Varna") AND PY=2025
+data/input/
+├── omega.csv
+├── quartiles.csv
+└── scival.csv
 ```
 
-### 2. OMEGA-ID verification — WoS Expanded
+Create it with:
 
 ```bash
-monverify fetch-wos --omega "OMEGA_2025.xlsm - Worksheet (1).csv" --database-id WOK \
-  --output data/raw/wos_omega_ids_2025.json
+mkdir -p data/input data/raw data/output
 ```
 
-This retrieves the WoS/BCI/etc. identifiers already present in OMEGA and validates their record metadata independently of the institution-discovery result set.
+Copy your files into `data/input/`.
 
-### 3. Independent discovery — Scopus
+## Step 1 — inspect inputs
 
 ```bash
-monverify fetch-scopus --year 2025 --affiliation-id 60005828 \
-  --output data/raw/scopus_2025.json
+monverify inspect-omega data/input/omega.csv
+monverify inspect-quartiles data/input/quartiles.csv
+monverify inspect-scival data/input/scival.csv
+monverify inspect-ministry
 ```
 
-Default query:
+`inspect-ministry` without a workbook shows the versioned 2025 claim from `config/rules_2025.yaml`.
 
-```text
-AF-ID(60005828) AND PUBYEAR = 2025
-```
+## Step 2 — independent WoS discovery
 
-### 4. OMEGA-ID verification — Scopus
+This searches Organization-Enhanced `Medical University Varna` for 2025 and writes a compact JSON file:
 
 ```bash
-monverify fetch-scopus --omega "OMEGA_2025.xlsm - Worksheet (1).csv" \
-  --output data/raw/scopus_omega_ids_2025.json
+monverify fetch-wos \
+  --year 2025 \
+  --output data/raw/wos_2025_discovery.json
 ```
 
-This uses Scopus Abstract Retrieval by the Scopus IDs already stored in OMEGA. Failed identifier lookups are preserved in the JSON rather than terminating the whole batch.
+The saved JSON does **not** contain the large complete Expanded API records. Each record is normalized immediately to the fields required by MON Verify:
 
-The JSON files contain raw API responses and retrieval metadata. Individual page responses are also cached under `data/raw/wos/` and `data/raw/scopus/`.
+- WoS UT;
+- DOI;
+- title;
+- year;
+- document type;
+- journal;
+- ISSN/eISSN;
+- MU-Varna affiliation evidence;
+- MU-Varna authors linked through WoS addresses;
+- enhanced institution names and institution count;
+- WoS evidence URL.
 
-## Build and verify
+The HTTP page cache under `data/raw/wos/` may still contain raw API pages for retry/reproducibility. Delete that cache after successful compact export if disk space is a concern:
 
-OMEGA/JCR baseline only:
+```bash
+rm -rf data/raw/wos
+```
+
+## Step 3 — verify the WoS IDs already present in OMEGA
+
+Run a second retrieval so OMEGA records that may not appear in the discovery result are checked directly by UT:
+
+```bash
+monverify fetch-wos \
+  --omega data/input/omega.csv \
+  --output data/raw/wos_2025_omega_ids.json
+```
+
+`RC...` Research Commons identifiers are skipped automatically.
+
+## Step 4 — run verification
 
 ```bash
 monverify verify \
-  --ministry "assess-MUV-2025(1).xlsx" \
-  --omega "OMEGA_2025.xlsm - Worksheet (1).csv" \
-  --quartiles journals_Q_wos_2025.csv \
+  --omega data/input/omega.csv \
+  --quartiles data/input/quartiles.csv \
+  --scival-csv data/input/scival.csv \
+  --wos-json data/raw/wos_2025_discovery.json \
+  --wos-json data/raw/wos_2025_omega_ids.json \
   --output-dir data/output
 ```
 
-Full API reconciliation:
+If you also have the Ministry XLSX and want to parse it rather than use the versioned claim:
 
 ```bash
 monverify verify \
-  --ministry "assess-MUV-2025(1).xlsx" \
-  --omega "OMEGA_2025.xlsm - Worksheet (1).csv" \
-  --quartiles journals_Q_wos_2025.csv \
-  --wos-json data/raw/wos_2025.json \
-  --wos-json data/raw/wos_omega_ids_2025.json \
-  --scopus-json data/raw/scopus_2025.json \
-  --scopus-json data/raw/scopus_omega_ids_2025.json \
+  --ministry /path/to/assess-MUV-2025.xlsx \
+  --omega data/input/omega.csv \
+  --quartiles data/input/quartiles.csv \
+  --scival-csv data/input/scival.csv \
+  --wos-json data/raw/wos_2025_discovery.json \
+  --wos-json data/raw/wos_2025_omega_ids.json \
   --output-dir data/output
 ```
-
-The OMEGA-only run is **not** a completed Ministry verification because it lacks independent API affiliation and institution-count evidence. Such records remain `eligible_for_calculation = unresolved`; the tool does not assume a 1.0 contribution when institution count is unknown.
-
-## SciVal fallback
-
-No SciVal column names are assumed. When a SciVal export is supplied, identify the actual columns explicitly.
-
-Example:
-
-```bash
-monverify verify \
-  ... \
-  --scival-csv scival.csv \
-  --scival-count-column "Number of institutions" \
-  --scival-doi-column DOI
-```
-
-You can instead identify records using explicit WoS or Scopus identifier columns.
 
 ## Outputs
 
 `data/output/` contains:
 
-- `canonical_publications.csv`
-- `ministry_comparison.csv`
-- `ministry_corrections.csv`
-- `unresolved_records.csv`
-- `over_10_institutions.csv`
-- `verification_summary.json`
+```text
+canonical_publications.csv
+united_verification_table.csv
+ministry_comparison.csv
+ministry_corrections.csv
+unresolved_records.csv
+over_10_institutions.csv
+verification_summary.json
+```
 
-Every canonical publication retains source provenance and available evidence URLs. `verification_summary.json` also records the run timestamp, rules version, source file names, SHA-256 hashes, API query/retrieval metadata when present, and the Git commit when run inside a Git checkout.
+The united table is OMEGA-shaped and ordered:
 
-Important discrepancy codes include:
+```text
+Confirmed → Unresolved → Excluded
+```
 
-- `OMEGA_ONLY`
-- `WOS_ONLY`
-- `SCOPUS_ONLY`
-- `YEAR_MISMATCH`
-- `AFFILIATION_MISMATCH`
-- `QUARTILE_MISMATCH`
-- `QUARTILE_AMBIGUOUS`
-- `JOURNAL_NOT_IN_JCR`
-- `INSTITUTION_COUNT_MISMATCH`
+It preserves `Authors MU-Varna` and adds `MUV authors WOS`.
 
-## Deduplication
+## Summary calculation behavior
 
-The union of WoS and Scopus is counted once per publication.
+The summary always reports numeric totals for **confirmed eligible publications**, even when other records are unresolved.
 
-Automatic merge hierarchy:
+Example structure:
 
-1. normalized DOI exact match
-2. exact WoS/Scopus identifiers
-3. exact normalized title with compatible year (`±1` year to preserve online-first/issue-year conflicts)
+```json
+{
+  "calculated": {
+    "publication_count": 436,
+    "raw": {
+      "a1": 100,
+      "a2": 90,
+      "a3": 34,
+      "a4": 50
+    },
+    "unresolved_eligibility_count": 38,
+    "calculation_complete": false,
+    "calculation_note": "Confirmed subtotal only; unresolved records are reported separately"
+  }
+}
+```
 
-Fuzzy title similarity is **not** used for automatic publication merging.
+The older behavior that changed an entire bucket to JSON `null` when one unresolved publication existed in that bucket has been removed.
 
 ## Streamlit
 
-Run locally:
+Start locally:
 
 ```bash
-streamlit run streamlit_app.py
+source .venv/bin/activate
+monverify ui
 ```
 
 or:
 
 ```bash
-monverify ui
+streamlit run streamlit_app.py
 ```
 
-The app supports:
+In the browser:
 
-- uploaded/cached WoS and Scopus API data
-- direct API calls from Streamlit
-- Ministry vs calculated KPIs
-- publication explorer
-- discrepancy explorer
-- `>10 institutions` records
-- unresolved records
-- CSV/JSON downloads
+1. upload OMEGA CSV;
+2. upload the 2025 quartiles CSV;
+3. upload the header-first SciVal CSV;
+4. optionally upload the Ministry XLSX;
+5. choose either uploaded/cached WoS JSON or Live WoS API;
+6. run verification;
+7. inspect/download the united table, discrepancy tables, >10-institution records, and summary.
 
-### Streamlit Community Cloud
-
-For Streamlit Community Cloud, deploy `streamlit_app.py` from the repository root. `requirements.txt` installs the local package with `-e .`.
-
-The app can read keys from Streamlit Secrets:
-
-```toml
-WOS_API_KEY = "..."
-SCOPUS_API_KEY = "..."
-SCOPUS_INSTTOKEN = "..."
-```
-
-Scopus institutional entitlements may depend on institutional IP or token configuration. For reproducibility, the hosted app also supports uploading JSON retrieved by the local CLI.
+No Scopus API key is requested or used.
 
 ## Tests
 
@@ -308,24 +276,16 @@ Scopus institutional entitlements may depend on institutional IP or token config
 pytest
 ```
 
-CI uses mocked/synthetic data and does not require real API keys.
+CI uses mocked APIs and requires no real API key.
 
-The rules fixture verifies:
+Key regression coverage includes:
 
-```text
-Q1 = 116 - 14 + 14*0.1 = 103.4
-Q2 = 93 - 1 + 1*0.1 = 92.1
-Q3 = 50
-a4 = 75
-a = 968.3
-```
-
-Tests also cover normalization, 10-vs-11 institution boundary, Ministry parsing, OMEGA ID preservation, quartile matching, deduplication, WoS organization counting, and WoS/Scopus pagination.
-
-## Current verification limitations
-
-- WoS enhanced-organization count is treated as the primary institution count. Any case where Enhanced Organization metadata is absent remains unresolved instead of guessing from suborganizations.
-- Scopus Search API affiliation metadata is used only when present. If it does not provide a reliable complete institution set for a record, import a SciVal institution-count export.
-- Online-first vs issue-year conflicts are preserved rather than silently corrected.
-- Fuzzy journal-title matches never assign a quartile automatically.
-- The Ministry result is never used to tune or force the independent calculation.
+- Q1/Q2 Ministry fixture (`103.4`, `92.1`, final `968.3`);
+- 10-vs-11 institution threshold;
+- WoS pagination;
+- RC Research Commons exclusion;
+- compact WoS round-trip;
+- WoS institution-count priority over SciVal;
+- SciVal fallback when WoS count is missing;
+- numeric summary subtotals when unresolved publications remain;
+- normalization, deduplication and quartile matching.

@@ -1,5 +1,6 @@
 from monverify.clients.wos import (
     WOSClient,
+    compact_wos_pages,
     extract_wos_muv_authors,
     is_research_commons_uid,
     normalize_wos_record,
@@ -106,6 +107,18 @@ def test_research_commons_prefix_detection():
 def test_records_from_payload():
     payload = {"Data": {"Records": {"records": {"REC": [sample_record(2)]}}}}
     assert len(wos_records_from_payload(payload)) == 1
+
+
+def test_compact_wos_round_trip():
+    payload = {"Data": {"Records": {"records": {"REC": [sample_record(11)]}}}}
+    compact = compact_wos_pages([payload])
+    assert len(compact) == 1
+    assert compact[0]["_monverify_compact"] is True
+    restored = normalize_wos_record(compact[0])
+    assert restored.wos_ut == "WOS:0001"
+    assert restored.doi == "10.1000/test"
+    assert restored.institution_count == 11
+    assert restored.muv_affiliation is True
 
 
 class FakeResponse:
