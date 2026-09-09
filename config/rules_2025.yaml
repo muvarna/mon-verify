@@ -1,4 +1,4 @@
-version: "2025.1"
+version: "2025.2-home-wos-scival"
 assessment_year: 2025
 formula:
   a1: 5
@@ -12,7 +12,6 @@ institution_rule:
   over_threshold_multiplier: 0.1
   source_priority:
     - wos
-    - scopus
     - scival
 document_types:
   include: "all"
@@ -25,5 +24,16 @@ quartiles:
 wos:
   database_id: WOK
   organization_enhanced: "Medical University Varna"
-scopus:
-  affiliation_id: "60005828"
+ministry_claim:
+  publication_count: 334
+  q1_raw: 116
+  q1_over_10: 14
+  q1_weighted: 103.4
+  q2_raw: 93
+  q2_over_10: 1
+  q2_weighted: 92.1
+  q3_raw: 50
+  q3_weighted: 50.0
+  a4_raw: 75
+  a4_weighted: 75.0
+  a_score: 968.3
