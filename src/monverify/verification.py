@@ -154,8 +154,14 @@ def merge_group(
         discrepancies.append("JOURNAL_NOT_IN_JCR")
     elif quartile.method == "title_fuzzy" or quartile.confidence in {"manual_review", "ambiguous"}:
         discrepancies.append("QUARTILE_AMBIGUOUS")
+
+    # Institution-count differences matter only when they change the >10 rule.
+    # Example: WoS=8 vs SciVal=10 is harmless (both multiplier 1.0), while
+    # WoS=10 vs SciVal=11 must be flagged because the multiplier changes.
     if wos_count is not None and scival_count is not None and wos_count != scival_count:
-        discrepancies.append("INSTITUTION_COUNT_MISMATCH")
+        if rules.is_over_threshold(wos_count) != rules.is_over_threshold(scival_count):
+            discrepancies.append("INSTITUTION_COUNT_MISMATCH")
+
     if scival_row and original_sid and original_sid != scival_row.scopus_id:
         discrepancies.append("SCOPUS_ID_CORRECTED_FROM_SCIVAL")
     elif scival_row and not original_sid:
@@ -166,7 +172,8 @@ def merge_group(
     years = {r.source: r.year for r in group if r.year is not None}
     if scival_row and scival_row.year is not None:
         years["scival"] = scival_row.year
-    if len(set(years.values())) > 1:
+    year_values = set(years.values())
+    if len(year_values) > 1 and rules.assessment_year not in year_values:
         discrepancies.append("YEAR_MISMATCH")
 
     wos_ut = _first(group, "wos_ut")

@@ -14,7 +14,7 @@ def _quartiles():
     ]))
 
 
-def _scival(count=9, sid="123456789", doi="10.1000/x"):
+def _scival(count=9, sid="123456789", doi="10.1000/x", year=2025):
     return SciValIndex([
         SciValPublication(
             eid=f"2-s2.0-{sid}",
@@ -22,13 +22,13 @@ def _scival(count=9, sid="123456789", doi="10.1000/x"):
             doi=doi,
             title="T",
             normalized_title="t",
-            year=2025,
+            year=year,
             institution_count=count,
         )
     ])
 
 
-def test_wos_count_has_priority_over_scival():
+def test_wos_count_has_priority_over_scival_and_boundary_mismatch_is_flagged():
     rules = RuleEngine.from_yaml("config/rules_2025.yaml")
     group = [
         SourceRecord(source="omega", source_id="o", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1000/x"),
@@ -40,6 +40,38 @@ def test_wos_count_has_priority_over_scival():
     assert pub.over_10_institutions is True
     assert pub.weighted_contribution == 0.1
     assert "INSTITUTION_COUNT_MISMATCH" in pub.discrepancy_codes
+
+
+def test_institution_count_mismatch_below_threshold_is_ignored():
+    rules = RuleEngine.from_yaml("config/rules_2025.yaml")
+    group = [
+        SourceRecord(source="omega", source_id="o", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1000/x"),
+        SourceRecord(source="wos", source_id="w", wos_ut="WOS:1", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1000/x", institution_count=8, muv_affiliation=True),
+    ]
+    pub = merge_group(group, quartiles=_quartiles(), rules=rules, scival_index=_scival(10))
+    assert pub.selected_institution_count == 8
+    assert pub.weighted_contribution == 1.0
+    assert "INSTITUTION_COUNT_MISMATCH" not in pub.discrepancy_codes
+
+
+def test_year_mismatch_is_ignored_when_any_source_is_assessment_year():
+    rules = RuleEngine.from_yaml("config/rules_2025.yaml")
+    group = [
+        SourceRecord(source="omega", source_id="o", title="T", normalized_title="t", year=2024, source_title="Journal", issn="12345678", doi="10.1000/x"),
+        SourceRecord(source="wos", source_id="w", wos_ut="WOS:1", title="T", normalized_title="t", year=2025, source_title="Journal", issn="12345678", doi="10.1000/x", institution_count=4, muv_affiliation=True),
+    ]
+    pub = merge_group(group, quartiles=_quartiles(), rules=rules, scival_index=_scival(4, year=2024))
+    assert "YEAR_MISMATCH" not in pub.discrepancy_codes
+
+
+def test_year_mismatch_is_flagged_when_sources_disagree_and_none_is_assessment_year():
+    rules = RuleEngine.from_yaml("config/rules_2025.yaml")
+    group = [
+        SourceRecord(source="omega", source_id="o", title="T", normalized_title="t", year=2024, source_title="Journal", issn="12345678", doi="10.1000/x"),
+        SourceRecord(source="wos", source_id="w", wos_ut="WOS:1", title="T", normalized_title="t", year=2023, source_title="Journal", issn="12345678", doi="10.1000/x", institution_count=4, muv_affiliation=True),
+    ]
+    pub = merge_group(group, quartiles=_quartiles(), rules=rules, scival_index=_scival(4, year=2024))
+    assert "YEAR_MISMATCH" in pub.discrepancy_codes
 
 
 def test_scival_is_used_when_wos_count_missing_and_eid_is_added():
